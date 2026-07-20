@@ -362,16 +362,9 @@ GradientResult impulse::computePotentialAndGradient(OpBuilder &builder,
       DenseElementsAttr::get(scalarType, builder.getFloatAttr(elemType, 1.0)));
 
   bool isCustomLogpdf = ctx.hasCustomLogpdf();
-  auto flatType = RankedTensorType::get({ctx.positionSize}, elemType);
   Value autodiffPosition = position;
   auto autodiffPositionType = positionType;
   auto autodiffGradType = positionType;
-  if (isCustomLogpdf) {
-    autodiffPosition =
-        impulse::ReshapeOp::create(builder, loc, flatType, position);
-    autodiffPositionType = flatType;
-    autodiffGradType = flatType;
-  }
 
   SmallVector<Value> autodiffInputs{autodiffPosition, gradSeed};
   SmallVector<NamedAttribute> adAttrs{
@@ -446,9 +439,6 @@ GradientResult impulse::computePotentialAndGradient(OpBuilder &builder,
   builder.setInsertionPointAfter(autodiffOp);
 
   Value grad = autodiffOp.getResult(2);
-  if (isCustomLogpdf) {
-    grad = impulse::ReshapeOp::create(builder, loc, positionType, grad);
-  }
 
   return {
       autodiffOp.getResult(0), // U
@@ -729,10 +719,8 @@ InitialHMCState impulse::InitHMC(OpBuilder &builder, Location loc, Value rng,
 
   if (ctx.hasCustomLogpdf()) {
     q0 = initialPosition;
-    auto flatType = RankedTensorType::get({ctx.positionSize}, elemType);
-    auto q0Flat = impulse::ReshapeOp::create(builder, loc, flatType, q0);
     SmallVector<Value> callArgs;
-    callArgs.push_back(q0Flat);
+    callArgs.push_back(q0);
     callArgs.append(ctx.fnInputs.begin(), ctx.fnInputs.end());
     auto callOp = func::CallOp::create(builder, loc, ctx.logpdfFn,
                                        TypeRange{scalarType}, callArgs);
@@ -776,15 +764,9 @@ InitialHMCState impulse::InitHMC(OpBuilder &builder, Location loc, Value rng,
 
   // 4. Compute initial gradient at q0
   bool isCustomLogpdf = ctx.hasCustomLogpdf();
-  auto flatType = RankedTensorType::get({ctx.positionSize}, elemType);
   Value autodiffQ0 = q0;
   auto autodiffQ0Type = positionType;
   auto autodiffGradType = positionType;
-  if (isCustomLogpdf) {
-    autodiffQ0 = impulse::ReshapeOp::create(builder, loc, flatType, q0);
-    autodiffQ0Type = flatType;
-    autodiffGradType = flatType;
-  }
 
   auto gradSeedInit = arith::ConstantOp::create(
       builder, loc, scalarType,
@@ -863,9 +845,6 @@ InitialHMCState impulse::InitHMC(OpBuilder &builder, Location loc, Value rng,
   builder.setInsertionPointAfter(autodiffInit);
 
   Value grad0 = autodiffInit.getResult(2);
-  if (isCustomLogpdf) {
-    grad0 = impulse::ReshapeOp::create(builder, loc, positionType, grad0);
-  }
 
   conditionalDump(builder, loc, q0, "InitHMC: q0 (unconstrained)", debugDump);
   conditionalDump(builder, loc, U0, "InitHMC: U0 (potential energy)",

@@ -19,10 +19,11 @@ struct SampleInvariantCodeMotionPass
           SampleInvariantCodeMotionPass> {
 
   void runOnOperation() override {
-    SmallVector<MCMCRegionOp> regions;
-    getOperation()->walk([&](MCMCRegionOp op) { regions.push_back(op); });
+    SmallVector<impulse::MCMCRegionOp> regions;
+    getOperation()->walk(
+        [&](impulse::MCMCRegionOp op) { regions.push_back(op); });
 
-    for (MCMCRegionOp regionOp : regions) {
+    for (impulse::MCMCRegionOp regionOp : regions) {
       hoistSampleInvariantOps(regionOp);
     }
   }

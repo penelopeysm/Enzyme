@@ -8,13 +8,13 @@
 using namespace mlir;
 using namespace mlir::enzyme;
 
-SampleDependenceAnalysis::SampleDependenceAnalysis(MCMCRegionOp regionOp)
+SampleDependenceAnalysis::SampleDependenceAnalysis(impulse::MCMCRegionOp regionOp)
     : regionOp(regionOp), target(AnalysisTarget::Sampler) {
   runSamplerAnalysis();
 }
 
-SampleDependenceAnalysis::SampleDependenceAnalysis(MCMCRegionOp regionOp,
-                                                   AnalysisTarget target)
+SampleDependenceAnalysis::SampleDependenceAnalysis(
+    impulse::MCMCRegionOp regionOp, AnalysisTarget target)
     : regionOp(regionOp), target(target) {
   if (target == AnalysisTarget::Logpdf)
     runLogpdfAnalysis();
@@ -37,7 +37,7 @@ void SampleDependenceAnalysis::propagateDependence(Region &region) {
   while (changed) {
     changed = false;
     region.walk([&](Operation *op) {
-      if (isa<SampleRegionOp>(op))
+      if (isa<impulse::SampleRegionOp>(op))
         return;
 
       bool hasDependent = false;
@@ -80,7 +80,7 @@ void SampleDependenceAnalysis::runSamplerAnalysis() {
     }
   }
 
-  regionOp.getSampler().walk([&](SampleRegionOp sampleOp) {
+  regionOp.getSampler().walk([&](impulse::SampleRegionOp sampleOp) {
     sampleOps.push_back(sampleOp);
     auto symbol = sampleOp.getSymbolAttr();
     bool isSelected =
@@ -132,9 +132,8 @@ bool SampleDependenceAnalysis::isInTargetRegion(Operation *op) {
 }
 
 bool SampleDependenceAnalysis::canHoist(Operation *op) const {
-  if (isa<SampleRegionOp>(op))
+  if (isa<impulse::SampleRegionOp>(op))
     return false;
-
   if (op->hasTrait<OpTrait::IsTerminator>())
     return false;
 
@@ -150,7 +149,7 @@ bool SampleDependenceAnalysis::canHoist(Operation *op) const {
 }
 
 static bool checkOperandDominance(IRMapping &regionToOuter, DominanceInfo &dom,
-                                  MCMCRegionOp regionOp,
+                                  impulse::MCMCRegionOp regionOp,
                                   SetVector<Operation *> &toHoist,
                                   ValueRange values) {
   for (Value value : values) {
@@ -193,7 +192,7 @@ hasMemoryConflict(ArrayRef<MemoryEffects::EffectInstance> opEffects,
   return false;
 }
 
-static bool hoistFromRegion(MCMCRegionOp regionOp,
+static bool hoistFromRegion(impulse::MCMCRegionOp regionOp,
                             SampleDependenceAnalysis &sampleAnalysis,
                             Region &region) {
   if (region.empty())
@@ -285,11 +284,11 @@ static bool hoistFromRegion(MCMCRegionOp regionOp,
   return !sortedToHoist.empty();
 }
 
-bool enzyme::hoistSampleInvariantOps(MCMCRegionOp regionOp) {
+bool enzyme::hoistSampleInvariantOps(impulse::MCMCRegionOp regionOp) {
   return hoistSampleInvariantOps(regionOp, AnalysisTarget::Sampler);
 }
 
-bool enzyme::hoistSampleInvariantOps(MCMCRegionOp regionOp,
+bool enzyme::hoistSampleInvariantOps(impulse::MCMCRegionOp regionOp,
                                      AnalysisTarget target) {
   SampleDependenceAnalysis analysis(regionOp, target);
   return hoistFromRegion(regionOp, analysis, analysis.getTargetRegion());

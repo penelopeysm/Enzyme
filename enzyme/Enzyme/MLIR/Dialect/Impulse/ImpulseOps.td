@@ -27,10 +27,12 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 def SymbolAttr : Impulse_Attr<"Symbol", "symbol"> {
   let summary = "Symbol associated with a Sample op";
   let description = [{
-  Symbol associated with a Sample op.
+  Symbol associated with a Sample op. Holds one or more uint64_t values.
+  A single value is a leaf symbol; multiple values encode a composite path
+  created by SICM submodel inlining.
   }];
-  let parameters = (ins "uint64_t":$ptr);
-  let assemblyFormat = "`<` $ptr `>`";
+  let parameters = (ins ArrayRefParameter<"uint64_t", "symbol path">:$path);
+  let hasCustomAssemblyFormat = 1;
 }
 
 def AddressAttr : TypedArrayAttrBase<SymbolAttr, "Address as an array of symbols">;
@@ -299,6 +301,113 @@ def InferOp : Impulse_Op<"infer", [DeclareOpInterfaceMethods<SymbolUserOpInterfa
   let hasVerifier = 1;
 }
 
+def SampleRegionOp : Impulse_Op<"sample_region", [AutomaticAllocationScope]> {
+  let summary = "Sample from distribution with inlined sampler and logpdf";
+  let description = [{
+    A region-based sample operation where both the sampler function and
+    logpdf function bodies are inlined as nested regions.
+  }];
+
+  let arguments = (ins
+    Variadic<AnyType>:$inputs,
+    OptionalAttr<StrAttr>:$fn,
+    OptionalAttr<StrAttr>:$logpdf_fn,
+    OptionalAttr<SymbolAttr>:$symbol,
+    OptionalAttr<SupportAttr>:$support,
+    DefaultValuedStrAttr<StrAttr, "">:$name
+  );
+
+  let results = (outs Variadic<AnyType>:$outputs);
+
+  let regions = (region
+    AnyRegion:$sampler,
+    AnyRegion:$logpdf
+  );
+
+  let assemblyFormat = [{
+    `(` $inputs `)` `sampler` $sampler `logpdf` $logpdf attr-dict
+    `:` functional-type($inputs, $outputs)
+  }];
+}
+
+def MCMCRegionOp : Impulse_Op<"mcmc_region", [AutomaticAllocationScope, AttrSizedOperandSegments]> {
+  let summary = "Inference region with sampler and unified logpdf";
+  let description = [{
+    A region-based inference operation with two regions:
+
+    - `sampler`: The model computation containing sample_region ops with sampler
+      regions (logpdf regions cleared after merging). Used by proposal-based
+      algorithms (MH, Gibbs) and preserved for outline compatibility.
+
+    - `logpdf`: Unified logpdf computation for ALL position-dependent terms.
+      Block arguments follow a calling convention:
+        args[0..num_position_args-1] = position values (sample-dependent,
+          ordered by `selection` attribute)
+        Captured values from enclosing scope = parameters (sample-invariant)
+
+      SICM operates on this region. The outline pass converts it to a
+      standalone function referenced by `logpdf_fn` on the resulting InferOp.
+
+    If the `logpdf` region is empty, the operation falls back to the sampler-only
+    mode (pre-logpdf-merging state or custom logpdf_fn).
+  }];
+
+  let arguments = (ins
+    Variadic<AnyType>:$inputs,
+    Optional<AnyRankedTensor>:$original_trace,
+    AddressArrayAttr:$selection,
+    AddressArrayAttr:$all_addresses,
+
+    DefaultValuedAttr<I64Attr, "0">:$num_warmup,
+    DefaultValuedAttr<I64Attr, "1">:$num_samples,
+    DefaultValuedAttr<I64Attr, "1">:$thinning,
+
+    Optional<AnyRankedTensor>:$inverse_mass_matrix,
+    Optional<AnyRankedTensor>:$step_size,
+
+    OptionalAttr<HMCConfigAttr>:$hmc_config,
+    OptionalAttr<NUTSConfigAttr>:$nuts_config,
+
+    OptionalAttr<FlatSymbolRefAttr>:$logpdf_fn,
+    Optional<AnyRankedTensor>:$initial_position,
+
+    Optional<AnyRankedTensor>:$initial_gradient,
+    Optional<AnyRankedTensor>:$initial_potential_energy,
+
+    OptionalAttr<StrAttr>:$fn,
+    DefaultValuedStrAttr<StrAttr, "">:$name,
+
+    DefaultValuedAttr<I64Attr, "0">:$num_position_args,
+    DefaultValuedAttr<I64Attr, "0">:$position_size,
+    OptionalAttr<SupportArrayAttr>:$supports
+  );
+
+  let regions = (region AnyRegion:$sampler, AnyRegion:$logpdf);
+
+  let results = (outs
+    AnyRankedTensor:$new_trace,
+    AnyRankedTensor:$diagnostics,
+    AnyRankedTensor:$log_densities,
+    AnyType:$output_rng_state,
+    AnyRankedTensor:$final_position,
+    AnyRankedTensor:$final_gradient,
+    AnyRankedTensor:$final_potential_energy,
+    AnyRankedTensor:$final_step_size,
+    AnyRankedTensor:$final_inverse_mass_matrix
+  );
+
+  let assemblyFormat = [{
+    `(` $inputs `)` (`given` $original_trace^)?
+    (`inverse_mass_matrix` `=` $inverse_mass_matrix^)?
+    (`step_size` `=` $step_size^)?
+    (`initial_position` `=` $initial_position^)?
+    (`initial_gradient` `=` $initial_gradient^)?
+    (`initial_potential_energy` `=` $initial_potential_energy^)?
+    $sampler (`logpdf` $logpdf^)?
+    attr-dict-with-keyword `:` functional-type(operands, results)
+  }];
+}
+
 //===----------------------------------------------------------------------===//
 // RNG ops
 //===----------------------------------------------------------------------===//
@@ -425,7 +534,7 @@ def IfOp : Impulse_Op<"if", [AutomaticAllocationScope, RecursiveMemoryEffects]> 
 }
 
 def YieldOp : Impulse_Op<"yield", [Pure, ReturnLike, Terminator,
-    ParentOneOf<["ForOp", "WhileOp", "IfOp"]>]> {
+    ParentOneOf<["ForOp", "WhileOp", "IfOp", "MCMCRegionOp", "SampleRegionOp"]>]> {
   let summary = "Yield values at the end of a loop or if op";
   let arguments = (ins Variadic<AnyType>:$operands);
   let assemblyFormat = [{

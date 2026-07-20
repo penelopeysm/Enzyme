@@ -8,7 +8,7 @@
 // The constant and multiplication that only depends on prior_mean should be hoisted
 // SICM: %[[CONST:.*]] = arith.constant dense<2.000000e+00> : tensor<f64>
 // SICM: %[[TWICE:.*]] = arith.mulf %{{.*}}, %[[CONST]] : tensor<f64>
-// SICM: enzyme.mcmc_region
+// SICM: impulse.mcmc_region
 
 module {
   func.func private @normal(%rng : tensor<2xui64>, %mean : tensor<f64>, %std : tensor<f64>)
@@ -24,21 +24,21 @@ module {
   }
 
   func.func @test_simple_hoisting(%rng : tensor<2xui64>, %prior_mean : tensor<f64>, %trace : tensor<1x1xf64>)
-      -> (tensor<1x1xf64>, tensor<1xi1>, tensor<2xui64>) {
+      -> (tensor<1x1xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>) {
     %step_size = arith.constant dense<0.1> : tensor<f64>
 
-    %result:8 = enzyme.mcmc @model_simple_hoist(%rng, %prior_mean) given %trace
+    %result:9 = impulse.infer @model_simple_hoist(%rng, %prior_mean) given %trace
         step_size = %step_size {
-      selection = [[#enzyme.symbol<1>]],
-      all_addresses = [[#enzyme.symbol<1>]],
-      hmc_config = #enzyme.hmc_config<trajectory_length = 1.0>,
+      selection = [[#impulse.symbol<1>]],
+      all_addresses = [[#impulse.symbol<1>]],
+      hmc_config = #impulse.hmc_config<trajectory_length = 1.0>,
       num_samples = 1 : i64,
       thinning = 1 : i64,
       num_warmup = 0 : i64
     } : (tensor<2xui64>, tensor<f64>, tensor<1x1xf64>, tensor<f64>)
-        -> (tensor<1x1xf64>, tensor<1xi1>, tensor<2xui64>, tensor<1x1xf64>, tensor<1x1xf64>, tensor<f64>, tensor<f64>, tensor<1x1xf64>)
+        -> (tensor<1x1xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>, tensor<1x1xf64>, tensor<1x1xf64>, tensor<f64>, tensor<f64>, tensor<1x1xf64>)
 
-    return %result#0, %result#1, %result#2 : tensor<1x1xf64>, tensor<1xi1>, tensor<2xui64>
+    return %result#0, %result#1, %result#2, %result#3 : tensor<1x1xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>
   }
 
   // Model with a sample-invariant operation (doubling prior_mean)
@@ -49,9 +49,9 @@ module {
     %two = arith.constant dense<2.0> : tensor<f64>
     %twice_mean = arith.mulf %prior_mean, %two : tensor<f64>
 
-    %x:2 = enzyme.sample @normal(%rng, %twice_mean, %std) {
+    %x:2 = impulse.sample @normal(%rng, %twice_mean, %std) {
       logpdf = @normal_logpdf,
-      symbol = #enzyme.symbol<1>
+      symbol = #impulse.symbol<1>
     } : (tensor<2xui64>, tensor<f64>, tensor<f64>) -> (tensor<2xui64>, tensor<f64>)
     return %x#0, %x#1 : tensor<2xui64>, tensor<f64>
   }
@@ -65,10 +65,10 @@ module {
 // The multiplication depends on sample result, so it should stay inside mcmc_region
 // Verify sample-dependent mulf does NOT appear before mcmc_region
 // SICM-NOT: arith.mulf
-// SICM: enzyme.mcmc_region
-// SICM: enzyme.sample_region
+// SICM: impulse.mcmc_region
+// SICM: impulse.sample_region
 // SICM: arith.mulf
-// SICM: enzyme.yield
+// SICM: impulse.yield
 
 module @no_hoist_module {
   func.func private @normal(%rng : tensor<2xui64>, %mean : tensor<f64>, %std : tensor<f64>)
@@ -84,21 +84,21 @@ module @no_hoist_module {
   }
 
   func.func @test_no_hoist_sample_dep(%rng : tensor<2xui64>, %prior_mean : tensor<f64>, %trace : tensor<1x1xf64>)
-      -> (tensor<1x1xf64>, tensor<1xi1>, tensor<2xui64>) {
+      -> (tensor<1x1xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>) {
     %step_size = arith.constant dense<0.1> : tensor<f64>
 
-    %result:8 = enzyme.mcmc @model_sample_dep(%rng, %prior_mean) given %trace
+    %result:9 = impulse.infer @model_sample_dep(%rng, %prior_mean) given %trace
         step_size = %step_size {
-      selection = [[#enzyme.symbol<1>]],
-      all_addresses = [[#enzyme.symbol<1>]],
-      hmc_config = #enzyme.hmc_config<trajectory_length = 1.0>,
+      selection = [[#impulse.symbol<1>]],
+      all_addresses = [[#impulse.symbol<1>]],
+      hmc_config = #impulse.hmc_config<trajectory_length = 1.0>,
       num_samples = 1 : i64,
       thinning = 1 : i64,
       num_warmup = 0 : i64
     } : (tensor<2xui64>, tensor<f64>, tensor<1x1xf64>, tensor<f64>)
-        -> (tensor<1x1xf64>, tensor<1xi1>, tensor<2xui64>, tensor<1x1xf64>, tensor<1x1xf64>, tensor<f64>, tensor<f64>, tensor<1x1xf64>)
+        -> (tensor<1x1xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>, tensor<1x1xf64>, tensor<1x1xf64>, tensor<f64>, tensor<f64>, tensor<1x1xf64>)
 
-    return %result#0, %result#1, %result#2 : tensor<1x1xf64>, tensor<1xi1>, tensor<2xui64>
+    return %result#0, %result#1, %result#2, %result#3 : tensor<1x1xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>
   }
 
   // Model where operations depend on sample results - should NOT be hoisted
@@ -106,9 +106,9 @@ module @no_hoist_module {
       -> (tensor<2xui64>, tensor<f64>) {
     %std = arith.constant dense<1.0> : tensor<f64>
 
-    %x:2 = enzyme.sample @normal(%rng, %prior_mean, %std) {
+    %x:2 = impulse.sample @normal(%rng, %prior_mean, %std) {
       logpdf = @normal_logpdf,
-      symbol = #enzyme.symbol<1>
+      symbol = #impulse.symbol<1>
     } : (tensor<2xui64>, tensor<f64>, tensor<f64>) -> (tensor<2xui64>, tensor<f64>)
 
     // This depends on sample result, so it should NOT be hoisted
@@ -130,7 +130,7 @@ module @no_hoist_module {
 // SICM: arith.addf
 // Verify no additional mulf (sample-dependent) appears before mcmc_region
 // SICM-NOT: arith.mulf
-// SICM: enzyme.mcmc_region
+// SICM: impulse.mcmc_region
 
 module @mixed_module {
   func.func private @normal(%rng : tensor<2xui64>, %mean : tensor<f64>, %std : tensor<f64>)
@@ -146,21 +146,21 @@ module @mixed_module {
   }
 
   func.func @test_mixed_hoisting(%rng : tensor<2xui64>, %prior_mean : tensor<f64>, %trace : tensor<1x1xf64>)
-      -> (tensor<1x1xf64>, tensor<1xi1>, tensor<2xui64>) {
+      -> (tensor<1x1xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>) {
     %step_size = arith.constant dense<0.1> : tensor<f64>
 
-    %result:8 = enzyme.mcmc @model_mixed(%rng, %prior_mean) given %trace
+    %result:9 = impulse.infer @model_mixed(%rng, %prior_mean) given %trace
         step_size = %step_size {
-      selection = [[#enzyme.symbol<1>]],
-      all_addresses = [[#enzyme.symbol<1>]],
-      hmc_config = #enzyme.hmc_config<trajectory_length = 1.0>,
+      selection = [[#impulse.symbol<1>]],
+      all_addresses = [[#impulse.symbol<1>]],
+      hmc_config = #impulse.hmc_config<trajectory_length = 1.0>,
       num_samples = 1 : i64,
       thinning = 1 : i64,
       num_warmup = 0 : i64
     } : (tensor<2xui64>, tensor<f64>, tensor<1x1xf64>, tensor<f64>)
-        -> (tensor<1x1xf64>, tensor<1xi1>, tensor<2xui64>, tensor<1x1xf64>, tensor<1x1xf64>, tensor<f64>, tensor<f64>, tensor<1x1xf64>)
+        -> (tensor<1x1xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>, tensor<1x1xf64>, tensor<1x1xf64>, tensor<f64>, tensor<f64>, tensor<1x1xf64>)
 
-    return %result#0, %result#1, %result#2 : tensor<1x1xf64>, tensor<1xi1>, tensor<2xui64>
+    return %result#0, %result#1, %result#2, %result#3 : tensor<1x1xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>
   }
 
   func.func @model_mixed(%rng : tensor<2xui64>, %prior_mean : tensor<f64>)
@@ -173,9 +173,9 @@ module @mixed_module {
     %offset = arith.constant dense<0.5> : tensor<f64>
     %adjusted_mean = arith.addf %twice_mean, %offset : tensor<f64>
 
-    %x:2 = enzyme.sample @normal(%rng, %adjusted_mean, %std) {
+    %x:2 = impulse.sample @normal(%rng, %adjusted_mean, %std) {
       logpdf = @normal_logpdf,
-      symbol = #enzyme.symbol<1>
+      symbol = #impulse.symbol<1>
     } : (tensor<2xui64>, tensor<f64>, tensor<f64>) -> (tensor<2xui64>, tensor<f64>)
 
     // This depends on sample, should NOT be hoisted
@@ -191,10 +191,10 @@ module @mixed_module {
 
 // SICM-LABEL: func.func @test_cholesky_hoisting
 // The cholesky of base_cov should be hoisted since base_cov is an input
-// SICM: %[[CHOL:.*]] = enzyme.cholesky %{{.*}}
-// SICM: enzyme.mcmc_region
+// SICM: %[[CHOL:.*]] = impulse.cholesky %{{.*}}
+// SICM: impulse.mcmc_region
 // No cholesky inside the mcmc_region
-// SICM-NOT: enzyme.cholesky
+// SICM-NOT: impulse.cholesky
 // SICM: return
 
 module @cholesky_module {
@@ -211,21 +211,21 @@ module @cholesky_module {
   }
 
   func.func @test_cholesky_hoisting(%rng : tensor<2xui64>, %base_cov : tensor<2x2xf64>, %trace : tensor<1x1xf64>)
-      -> (tensor<1x1xf64>, tensor<1xi1>, tensor<2xui64>) {
+      -> (tensor<1x1xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>) {
     %step_size = arith.constant dense<0.1> : tensor<f64>
 
-    %result:8 = enzyme.mcmc @model_cholesky(%rng, %base_cov) given %trace
+    %result:9 = impulse.infer @model_cholesky(%rng, %base_cov) given %trace
         step_size = %step_size {
-      selection = [[#enzyme.symbol<1>]],
-      all_addresses = [[#enzyme.symbol<1>]],
-      hmc_config = #enzyme.hmc_config<trajectory_length = 1.0>,
+      selection = [[#impulse.symbol<1>]],
+      all_addresses = [[#impulse.symbol<1>]],
+      hmc_config = #impulse.hmc_config<trajectory_length = 1.0>,
       num_samples = 1 : i64,
       thinning = 1 : i64,
       num_warmup = 0 : i64
     } : (tensor<2xui64>, tensor<2x2xf64>, tensor<1x1xf64>, tensor<f64>)
-        -> (tensor<1x1xf64>, tensor<1xi1>, tensor<2xui64>, tensor<1x1xf64>, tensor<1x1xf64>, tensor<f64>, tensor<f64>, tensor<1x1xf64>)
+        -> (tensor<1x1xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>, tensor<1x1xf64>, tensor<1x1xf64>, tensor<f64>, tensor<f64>, tensor<1x1xf64>)
 
-    return %result#0, %result#1, %result#2 : tensor<1x1xf64>, tensor<1xi1>, tensor<2xui64>
+    return %result#0, %result#1, %result#2, %result#3 : tensor<1x1xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>
   }
 
   // Model where cholesky only depends on input base_cov - should be hoisted
@@ -235,12 +235,12 @@ module @cholesky_module {
     %mean = arith.constant dense<0.0> : tensor<f64>
 
     // Cholesky on sample-invariant input - should be hoisted
-    %chol = enzyme.cholesky %base_cov : (tensor<2x2xf64>) -> tensor<2x2xf64>
+    %chol = impulse.cholesky %base_cov : (tensor<2x2xf64>) -> tensor<2x2xf64>
 
     // Sample a value
-    %x:2 = enzyme.sample @normal(%rng, %mean, %std) {
+    %x:2 = impulse.sample @normal(%rng, %mean, %std) {
       logpdf = @normal_logpdf,
-      symbol = #enzyme.symbol<1>
+      symbol = #impulse.symbol<1>
     } : (tensor<2xui64>, tensor<f64>, tensor<f64>) -> (tensor<2xui64>, tensor<f64>)
 
     // Use cholesky result with sample
@@ -279,18 +279,18 @@ module @cholesky_module {
 // No sample-dependent ops before mcmc_region
 // SICM-NOT: arith.addf
 // SICM-NOT: arith.mulf
-// SICM: enzyme.mcmc_region
+// SICM: impulse.mcmc_region
 // Sample site 1 uses hoisted twice_mean and one
-// SICM: enzyme.sample_region(%{{.*}}, %[[TWICE]], %[[ONE]])
+// SICM: impulse.sample_region(%{{.*}}, %[[TWICE]], %[[ONE]])
 // After sample_region 1 closes: sample-dependent shifted_mu stays inside
-// SICM: symbol = #enzyme.symbol<1>
+// SICM: symbol = #impulse.symbol<1>
 // SICM-NEXT: %[[SHIFT:.*]] = arith.addf
 // Sample site 2 uses sample-dependent shifted_mu and hoisted adjusted_std
-// SICM-NEXT: %{{.*}}:2 = enzyme.sample_region(%{{.*}}, %[[SHIFT]], %[[ADJSTD]])
+// SICM-NEXT: %{{.*}}:2 = impulse.sample_region(%{{.*}}, %[[SHIFT]], %[[ADJSTD]])
 // After sample_region 2 closes: sample-dependent result stays inside
-// SICM: symbol = #enzyme.symbol<2>
+// SICM: symbol = #impulse.symbol<2>
 // SICM-NEXT: %{{.*}} = arith.mulf %{{.*}}, %[[TWO]] : tensor<f64>
-// SICM-NEXT: enzyme.yield
+// SICM-NEXT: impulse.yield
 
 module @hierarchical_module {
   func.func private @normal(%rng : tensor<2xui64>, %mean : tensor<f64>, %std : tensor<f64>)
@@ -307,21 +307,21 @@ module @hierarchical_module {
 
   func.func @test_hierarchical(%rng : tensor<2xui64>, %prior_mean : tensor<f64>,
                                 %base_std : tensor<f64>, %trace : tensor<1x2xf64>)
-      -> (tensor<1x2xf64>, tensor<1xi1>, tensor<2xui64>) {
+      -> (tensor<1x2xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>) {
     %step_size = arith.constant dense<0.1> : tensor<f64>
 
-    %result:8 = enzyme.mcmc @model_hierarchical(%rng, %prior_mean, %base_std) given %trace
+    %result:9 = impulse.infer @model_hierarchical(%rng, %prior_mean, %base_std) given %trace
         step_size = %step_size {
-      selection = [[#enzyme.symbol<1>], [#enzyme.symbol<2>]],
-      all_addresses = [[#enzyme.symbol<1>], [#enzyme.symbol<2>]],
-      hmc_config = #enzyme.hmc_config<trajectory_length = 1.0>,
+      selection = [[#impulse.symbol<1>], [#impulse.symbol<2>]],
+      all_addresses = [[#impulse.symbol<1>], [#impulse.symbol<2>]],
+      hmc_config = #impulse.hmc_config<trajectory_length = 1.0>,
       num_samples = 1 : i64,
       thinning = 1 : i64,
       num_warmup = 0 : i64
     } : (tensor<2xui64>, tensor<f64>, tensor<f64>, tensor<1x2xf64>, tensor<f64>)
-        -> (tensor<1x2xf64>, tensor<1xi1>, tensor<2xui64>, tensor<1x2xf64>, tensor<1x2xf64>, tensor<f64>, tensor<f64>, tensor<1x2xf64>)
+        -> (tensor<1x2xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>, tensor<1x2xf64>, tensor<1x2xf64>, tensor<f64>, tensor<f64>, tensor<1x2xf64>)
 
-    return %result#0, %result#1, %result#2 : tensor<1x2xf64>, tensor<1xi1>, tensor<2xui64>
+    return %result#0, %result#1, %result#2, %result#3 : tensor<1x2xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>
   }
 
   func.func @model_hierarchical(%rng : tensor<2xui64>, %prior_mean : tensor<f64>,
@@ -335,9 +335,9 @@ module @hierarchical_module {
     %twice_mean = arith.mulf %prior_mean, %two : tensor<f64>
 
     // Sample site 1: group-level mean
-    %mu:2 = enzyme.sample @normal(%rng, %twice_mean, %std) {
+    %mu:2 = impulse.sample @normal(%rng, %twice_mean, %std) {
       logpdf = @normal_logpdf,
-      symbol = #enzyme.symbol<1>
+      symbol = #impulse.symbol<1>
     } : (tensor<2xui64>, tensor<f64>, tensor<f64>) -> (tensor<2xui64>, tensor<f64>)
 
     // Input-only between samples: should be hoisted
@@ -347,9 +347,9 @@ module @hierarchical_module {
     %shifted_mu = arith.addf %mu#1, %prior_mean : tensor<f64>
 
     // Sample site 2: observation-level
-    %x:2 = enzyme.sample @normal(%mu#0, %shifted_mu, %adjusted_std) {
+    %x:2 = impulse.sample @normal(%mu#0, %shifted_mu, %adjusted_std) {
       logpdf = @normal_logpdf,
-      symbol = #enzyme.symbol<2>
+      symbol = #impulse.symbol<2>
     } : (tensor<2xui64>, tensor<f64>, tensor<f64>) -> (tensor<2xui64>, tensor<f64>)
 
     // Sample-dependent (uses x): should NOT be hoisted

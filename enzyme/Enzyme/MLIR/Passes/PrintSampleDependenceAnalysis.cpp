@@ -21,7 +21,7 @@ struct PrintSampleDependencePass
   void runOnOperation() override {
     raw_ostream &os = llvm::outs();
 
-    getOperation()->walk([&](MCMCRegionOp regionOp) {
+    getOperation()->walk([&](impulse::MCMCRegionOp regionOp) {
       os << "=== SampleDependenceAnalysis for mcmc_region ===\n";
 
       SampleDependenceAnalysis analysis(regionOp);

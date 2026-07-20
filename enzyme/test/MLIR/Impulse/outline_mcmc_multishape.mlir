@@ -33,15 +33,15 @@ module {
     %scale = arith.constant dense<[2.0]> : tensor<1xf64>
 
     // alpha ~ scalar_sampler(scale) -> tensor<1xf64>
-    %alpha:2 = enzyme.sample @scalar_sampler(%rng, %scale) {
+    %alpha:2 = impulse.sample @scalar_sampler(%rng, %scale) {
       logpdf = @scalar_logpdf,
-      symbol = #enzyme.symbol<1>
+      symbol = #impulse.symbol<1>
     } : (tensor<2xui64>, tensor<1xf64>) -> (tensor<2xui64>, tensor<1xf64>)
 
     // y ~ vector_sampler(input) -> tensor<4xf64>
-    %y:2 = enzyme.sample @vector_sampler(%alpha#0, %input) {
+    %y:2 = impulse.sample @vector_sampler(%alpha#0, %input) {
       logpdf = @vector_logpdf,
-      symbol = #enzyme.symbol<2>
+      symbol = #impulse.symbol<2>
     } : (tensor<2xui64>, tensor<4xf64>) -> (tensor<2xui64>, tensor<4xf64>)
 
     return %y#0, %y#1 : tensor<2xui64>, tensor<4xf64>
@@ -50,21 +50,21 @@ module {
   // CHECK-LABEL: func.func @run_mcmc_multishape
   func.func @run_mcmc_multishape(
       %rng : tensor<2xui64>, %input : tensor<4xf64>, %trace : tensor<1x5xf64>)
-      -> (tensor<1x5xf64>, tensor<1xi1>, tensor<2xui64>) {
+      -> (tensor<1x5xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>) {
     %step_size = arith.constant dense<0.1> : tensor<f64>
 
-    %result:8 = enzyme.mcmc @multishape_model(%rng, %input) given %trace
+    %result:9 = impulse.infer @multishape_model(%rng, %input) given %trace
         step_size = %step_size {
-      selection = [[#enzyme.symbol<1>], [#enzyme.symbol<2>]],
-      all_addresses = [[#enzyme.symbol<1>], [#enzyme.symbol<2>]],
-      hmc_config = #enzyme.hmc_config<trajectory_length = 1.0>,
+      selection = [[#impulse.symbol<1>], [#impulse.symbol<2>]],
+      all_addresses = [[#impulse.symbol<1>], [#impulse.symbol<2>]],
+      hmc_config = #impulse.hmc_config<trajectory_length = 1.0>,
       num_samples = 1 : i64,
       thinning = 1 : i64,
       num_warmup = 0 : i64
     } : (tensor<2xui64>, tensor<4xf64>, tensor<1x5xf64>, tensor<f64>)
-        -> (tensor<1x5xf64>, tensor<1xi1>, tensor<2xui64>, tensor<1x5xf64>, tensor<1x5xf64>, tensor<f64>, tensor<f64>, tensor<1x5xf64>)
+        -> (tensor<1x5xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>, tensor<1x5xf64>, tensor<1x5xf64>, tensor<f64>, tensor<f64>, tensor<1x5xf64>)
 
-    return %result#0, %result#1, %result#2 : tensor<1x5xf64>, tensor<1xi1>, tensor<2xui64>
+    return %result#0, %result#1, %result#2, %result#3 : tensor<1x5xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>
   }
 }
 
@@ -72,7 +72,7 @@ module {
 // function, and that function must have return type matching the vector output.
 
 // The mcmc call appears before the outlined function definition in output
-// CHECK: enzyme.mcmc @[[MODEL:[a-zA-Z0-9_]+]]
+// CHECK: impulse.infer @[[MODEL:[a-zA-Z0-9_]+]]
 
 // The outlined function must return (tensor<2xui64>, tensor<4xf64>),
 // NOT (tensor<2xui64>, tensor<1xf64>) from the scalar sample's yield.

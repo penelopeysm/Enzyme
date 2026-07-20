@@ -1,4 +1,5 @@
 #include "Analysis/SampleDependenceAnalysis.h"
+#include "Dialect/Impulse/Impulse.h"
 #include "Dialect/Ops.h"
 #include "Passes/Passes.h"
 
@@ -18,22 +19,22 @@ namespace enzyme {
 } // namespace enzyme
 } // namespace mlir
 
-static enzyme::SymbolAttr composeSymbols(enzyme::SymbolAttr outer,
-                                         enzyme::SymbolAttr inner,
+static impulse::SymbolAttr composeSymbols(impulse::SymbolAttr outer,
+                                         impulse::SymbolAttr inner,
                                          MLIRContext *ctx) {
   SmallVector<uint64_t> composed(outer.getPath());
   composed.append(inner.getPath().begin(), inner.getPath().end());
-  return enzyme::SymbolAttr::get(ctx, composed);
+  return impulse::SymbolAttr::get(ctx, composed);
 }
 
 static ArrayAttr flattenAddressesForSymbol(ArrayAttr addresses,
-                                           enzyme::SymbolAttr outerSymbol,
+                                           impulse::SymbolAttr outerSymbol,
                                            MLIRContext *ctx) {
   SmallVector<Attribute> newAddresses;
   for (auto addr : addresses) {
     auto address = cast<ArrayAttr>(addr);
     if (address.size() >= 2 && address[0] == outerSymbol) {
-      auto inner = cast<enzyme::SymbolAttr>(address[1]);
+      auto inner = cast<impulse::SymbolAttr>(address[1]);
       auto composite = composeSymbols(outerSymbol, inner, ctx);
       SmallVector<Attribute> newAddr;
       newAddr.push_back(composite);
@@ -47,14 +48,14 @@ static ArrayAttr flattenAddressesForSymbol(ArrayAttr addresses,
   return ArrayAttr::get(ctx, newAddresses);
 }
 
-static bool inlineSubmodelSampleRegions(enzyme::MCMCRegionOp regionOp) {
+static bool inlineSubmodelSampleRegions(impulse::MCMCRegionOp regionOp) {
   bool anyChanged = false;
 
-  SmallVector<enzyme::SampleRegionOp> sampleOps;
+  SmallVector<impulse::SampleRegionOp> sampleOps;
   regionOp.getSampler().walk(
-      [&](enzyme::SampleRegionOp op) { sampleOps.push_back(op); });
+      [&](impulse::SampleRegionOp op) { sampleOps.push_back(op); });
 
-  for (enzyme::SampleRegionOp sampleOp : sampleOps) {
+  for (impulse::SampleRegionOp sampleOp : sampleOps) {
     Region &logpdf = sampleOp.getLogpdf();
     if (!logpdf.empty())
       continue;
@@ -82,11 +83,11 @@ static bool inlineSubmodelSampleRegions(enzyme::MCMCRegionOp regionOp) {
 
     for (Operation &op : samplerEntry.without_terminator()) {
       Operation *cloned = builder.clone(op, mapper);
-      if (auto innerSample = dyn_cast<enzyme::SampleRegionOp>(cloned)) {
+      if (auto innerSample = dyn_cast<impulse::SampleRegionOp>(cloned)) {
         if (auto innerSymbol = innerSample.getSymbolAttr())
           innerSample.setSymbolAttr(
               composeSymbols(outerSymbol, innerSymbol, ctx));
-      } else if (auto innerSampleOp = dyn_cast<enzyme::SampleOp>(cloned)) {
+      } else if (auto innerSampleOp = dyn_cast<impulse::SampleOp>(cloned)) {
         if (auto innerSymbol = innerSampleOp.getSymbolAttr())
           innerSampleOp.setSymbolAttr(
               composeSymbols(outerSymbol, innerSymbol, ctx));
@@ -113,7 +114,7 @@ static bool inlineSubmodelSampleRegions(enzyme::MCMCRegionOp regionOp) {
   return anyChanged;
 }
 
-static bool extractUnselectedSampleValues(enzyme::MCMCRegionOp regionOp) {
+static bool extractUnselectedSampleValues(impulse::MCMCRegionOp regionOp) {
   auto selection = regionOp.getSelectionAttr();
   if (!selection)
     return false;
@@ -134,9 +135,9 @@ static bool extractUnselectedSampleValues(enzyme::MCMCRegionOp regionOp) {
       blockToOuter.map(blockArg, inputs[idx]);
   }
 
-  SmallVector<enzyme::SampleRegionOp> toExtract;
+  SmallVector<impulse::SampleRegionOp> toExtract;
   for (auto &op : entry.without_terminator()) {
-    auto sampleOp = dyn_cast<enzyme::SampleRegionOp>(&op);
+    auto sampleOp = dyn_cast<impulse::SampleRegionOp>(&op);
     if (!sampleOp)
       continue;
     auto symbol = sampleOp.getSymbolAttr();
@@ -175,7 +176,7 @@ static bool extractUnselectedSampleValues(enzyme::MCMCRegionOp regionOp) {
   unsigned numInputs = inputs.size();
   bool anyChanged = false;
 
-  for (enzyme::SampleRegionOp sampleOp : toExtract) {
+  for (impulse::SampleRegionOp sampleOp : toExtract) {
     OpBuilder builder(regionOp);
     IRMapping cloneMapper(blockToOuter);
     Operation *cloned = builder.clone(*sampleOp, cloneMapper);
@@ -206,7 +207,7 @@ static bool extractUnselectedSampleValues(enzyme::MCMCRegionOp regionOp) {
 
 static Value resolveValueForLogpdf(OpBuilder &builder, Location loc,
                                    Value value, IRMapping &mapping,
-                                   enzyme::MCMCRegionOp regionOp) {
+                                   impulse::MCMCRegionOp regionOp) {
   if (mapping.contains(value))
     return mapping.lookup(value);
 
@@ -229,7 +230,7 @@ static Value resolveValueForLogpdf(OpBuilder &builder, Location loc,
   if (defOp->getParentRegion() != &regionOp.getSampler())
     return value;
 
-  if (isa<enzyme::SampleRegionOp>(defOp)) {
+  if (isa<impulse::SampleRegionOp>(defOp)) {
     Block *logpdfBlock = &regionOp.getLogpdf().front();
     Value newArg = logpdfBlock->addArgument(value.getType(), defOp->getLoc());
     mapping.map(value, newArg);
@@ -247,18 +248,18 @@ static Value resolveValueForLogpdf(OpBuilder &builder, Location loc,
   return mapping.lookup(value);
 }
 
-bool enzyme::constructUnifiedLogpdf(enzyme::MCMCRegionOp regionOp) {
+bool enzyme::constructUnifiedLogpdf(impulse::MCMCRegionOp regionOp) {
   Region &samplerRegion = regionOp.getSampler();
   Region &logpdfRegion = regionOp.getLogpdf();
   auto selection = regionOp.getSelectionAttr();
   if (!selection || selection.empty())
     return false;
 
-  SmallVector<enzyme::SampleRegionOp> allSampleOps;
+  SmallVector<impulse::SampleRegionOp> allSampleOps;
   samplerRegion.walk(
-      [&](enzyme::SampleRegionOp op) { allSampleOps.push_back(op); });
+      [&](impulse::SampleRegionOp op) { allSampleOps.push_back(op); });
 
-  DenseMap<Attribute, enzyme::SampleRegionOp> symbolToSampleOp;
+  DenseMap<Attribute, impulse::SampleRegionOp> symbolToSampleOp;
   for (auto sampleOp : allSampleOps) {
     if (auto sym = sampleOp.getSymbolAttr())
       symbolToSampleOp[sym] = sampleOp;
@@ -279,14 +280,14 @@ bool enzyme::constructUnifiedLogpdf(enzyme::MCMCRegionOp regionOp) {
 
   Location loc = regionOp.getLoc();
   IRMapping positionMapping;
-  SmallVector<enzyme::SupportAttr> supportsVec;
+  SmallVector<impulse::SupportAttr> supportsVec;
   int64_t totalPositionSize = 0;
 
   for (auto symbol : selectionOrder) {
     auto it = symbolToSampleOp.find(symbol);
     if (it == symbolToSampleOp.end())
       continue;
-    enzyme::SampleRegionOp sampleOp = it->second;
+    impulse::SampleRegionOp sampleOp = it->second;
 
     for (unsigned i = 1; i < sampleOp.getNumResults(); ++i) {
       Value sampleResult = sampleOp.getResult(i);
@@ -303,8 +304,8 @@ bool enzyme::constructUnifiedLogpdf(enzyme::MCMCRegionOp regionOp) {
     if (auto support = sampleOp.getSupportAttr())
       supportsVec.push_back(support);
     else
-      supportsVec.push_back(enzyme::SupportAttr::get(
-          regionOp.getContext(), enzyme::SupportKind::REAL, nullptr, nullptr));
+      supportsVec.push_back(impulse::SupportAttr::get(
+          regionOp.getContext(), impulse::SupportKind::REAL, nullptr, nullptr));
   }
 
   int64_t numPositionArgs = logpdfBlock->getNumArguments();
@@ -362,12 +363,12 @@ bool enzyme::constructUnifiedLogpdf(enzyme::MCMCRegionOp regionOp) {
   }
 
   if (totalLogpdf) {
-    enzyme::YieldOp::create(logpdfBuilder, loc, {totalLogpdf});
+    impulse::YieldOp::create(logpdfBuilder, loc, {totalLogpdf});
   } else {
     auto zeroConst = arith::ConstantOp::create(
         logpdfBuilder, loc, scalarF64,
         DenseElementsAttr::get(scalarF64, logpdfBuilder.getF64FloatAttr(0.0)));
-    enzyme::YieldOp::create(logpdfBuilder, loc, {zeroConst});
+    impulse::YieldOp::create(logpdfBuilder, loc, {zeroConst});
   }
 
   logpdfBuilder.getContext();
@@ -428,7 +429,7 @@ static void inlineFunctionIntoRegion(OpBuilder &builder, FunctionOpInterface fn,
       for (Value operand : op.getOperands()) {
         yieldOperands.push_back(fnMapper.lookupOrDefault(operand));
       }
-      enzyme::YieldOp::create(builder, op.getLoc(), yieldOperands);
+      impulse::YieldOp::create(builder, op.getLoc(), yieldOperands);
       continue;
     }
     builder.clone(op, fnMapper);
@@ -436,7 +437,7 @@ static void inlineFunctionIntoRegion(OpBuilder &builder, FunctionOpInterface fn,
 }
 
 static LogicalResult
-convertSampleToSampleRegion(OpBuilder &builder, enzyme::SampleOp sampleOp,
+convertSampleToSampleRegion(OpBuilder &builder, impulse::SampleOp sampleOp,
                             IRMapping &mapper,
                             SymbolTableCollection &symbolTable) {
   OpBuilder::InsertionGuard insertionGuard(builder);
@@ -454,7 +455,7 @@ convertSampleToSampleRegion(OpBuilder &builder, enzyme::SampleOp sampleOp,
           ? StringAttr::get(sampleOp.getContext(), *sampleOp.getLogpdf())
           : StringAttr{};
 
-  auto sampleRegionOp = enzyme::SampleRegionOp::create(
+  auto sampleRegionOp = impulse::SampleRegionOp::create(
       builder, loc, sampleOp.getResultTypes(), mappedInputs, fnStrAttr,
       logpdfStrAttr, sampleOp.getSymbolAttr(), sampleOp.getSupportAttr(),
       sampleOp.getNameAttr());
@@ -486,10 +487,10 @@ convertSampleToSampleRegion(OpBuilder &builder, enzyme::SampleOp sampleOp,
   return success();
 }
 
-struct InlineMCMCOp : public OpRewritePattern<enzyme::MCMCOp> {
-  using OpRewritePattern<enzyme::MCMCOp>::OpRewritePattern;
+struct InlineMCMCOp : public OpRewritePattern<impulse::InferOp> {
+  using OpRewritePattern<impulse::InferOp>::OpRewritePattern;
 
-  LogicalResult matchAndRewrite(enzyme::MCMCOp mcmcOp,
+  LogicalResult matchAndRewrite(impulse::InferOp mcmcOp,
                                 PatternRewriter &rewriter) const override {
     SymbolTableCollection symbolTable;
     Location loc = mcmcOp.getLoc();
@@ -515,8 +516,20 @@ struct InlineMCMCOp : public OpRewritePattern<enzyme::MCMCOp> {
                          : StringAttr::get(mcmcOp.getContext(),
                                            mcmcOp.getFnAttr().getValue());
 
-    auto mcmcRegionOp = enzyme::MCMCRegionOp::create(
-        rewriter, loc, mcmcOp.getResultTypes(), mcmcOp.getInputs(),
+    SmallVector<Type> regionResultTypes;
+    regionResultTypes.push_back(mcmcOp.getTrace().getType());
+    regionResultTypes.push_back(mcmcOp.getDiagnostics().getType());
+    regionResultTypes.push_back(mcmcOp.getLogDensities().getType());
+    regionResultTypes.push_back(mcmcOp.getOutputRngState().getType());
+    regionResultTypes.push_back(mcmcOp.getFinalPosition().getType());
+    regionResultTypes.push_back(mcmcOp.getFinalGradient().getType());
+    regionResultTypes.push_back(mcmcOp.getFinalPotentialEnergy().getType());
+    regionResultTypes.push_back(mcmcOp.getFinalStepSize().getType());
+    regionResultTypes.push_back(
+        mcmcOp.getFinalInverseMassMatrix().getType());
+
+    auto mcmcRegionOp = impulse::MCMCRegionOp::create(
+        rewriter, loc, regionResultTypes, mcmcOp.getInputs(),
         mcmcOp.getOriginalTrace(), mcmcOp.getSelectionAttr(),
         mcmcOp.getAllAddressesAttr(), mcmcOp.getNumWarmupAttr(),
         mcmcOp.getNumSamplesAttr(), mcmcOp.getThinningAttr(),
@@ -550,12 +563,12 @@ struct InlineMCMCOp : public OpRewritePattern<enzyme::MCMCOp> {
         for (Value operand : op.getOperands()) {
           yieldOperands.push_back(mapper.lookupOrDefault(operand));
         }
-        enzyme::YieldOp::create(rewriter, op.getLoc(), yieldOperands);
+        impulse::YieldOp::create(rewriter, op.getLoc(), yieldOperands);
         continue;
       }
 
       if (!isLogpdfMode) {
-        if (auto sampleOp = dyn_cast<enzyme::SampleOp>(&op)) {
+        if (auto sampleOp = dyn_cast<impulse::SampleOp>(&op)) {
           if (failed(convertSampleToSampleRegion(rewriter, sampleOp, mapper,
                                                  symbolTable))) {
             return failure();
@@ -601,7 +614,7 @@ static func::FuncOp outlineSampleSubRegion(OpBuilder &moduleBuilder,
     map.map(oldArg, newArg);
 
   for (Operation &op : entry.getOperations()) {
-    if (isa<enzyme::YieldOp>(&op)) {
+    if (isa<impulse::YieldOp>(&op)) {
       SmallVector<Value> returnOperands;
       for (Value operand : op.getOperands())
         returnOperands.push_back(map.lookupOrDefault(operand));
@@ -615,9 +628,9 @@ static func::FuncOp outlineSampleSubRegion(OpBuilder &moduleBuilder,
 }
 
 static void convertSampleRegionToSample(func::FuncOp outlinedFunc) {
-  SmallVector<enzyme::SampleRegionOp> toConvert;
+  SmallVector<impulse::SampleRegionOp> toConvert;
   outlinedFunc.walk(
-      [&](enzyme::SampleRegionOp op) { toConvert.push_back(op); });
+      [&](impulse::SampleRegionOp op) { toConvert.push_back(op); });
 
   auto *parentOp = outlinedFunc->getParentOp();
   OpBuilder moduleBuilder(&parentOp->getRegion(0));
@@ -652,7 +665,7 @@ static void convertSampleRegionToSample(func::FuncOp outlinedFunc) {
       logpdfAttr = FlatSymbolRefAttr::get(ctx, logpdfStrAttr);
     }
 
-    auto sampleOp = enzyme::SampleOp::create(
+    auto sampleOp = impulse::SampleOp::create(
         builder, sampleRegionOp.getLoc(), sampleRegionOp.getResultTypes(),
         fnAttr, sampleRegionOp.getInputs(), logpdfAttr,
         sampleRegionOp.getSymbolAttr(), sampleRegionOp.getSupportAttr(),
@@ -673,7 +686,7 @@ static FailureOr<func::FuncOp> outlineRegionToFunction(Region &region,
   Block &entryBlock = region.front();
 
   auto *terminator = entryBlock.getTerminator();
-  auto yieldOp = cast<enzyme::YieldOp>(terminator);
+  auto yieldOp = cast<impulse::YieldOp>(terminator);
   SmallVector<Type> resultTypes(yieldOp.getOperandTypes());
 
   llvm::SetVector<Value> freeValues;
@@ -708,7 +721,7 @@ static FailureOr<func::FuncOp> outlineRegionToFunction(Region &region,
   for (Block &block : outlinedBody) {
     if (!block.mightHaveTerminator())
       continue;
-    auto terminator = dyn_cast<enzyme::YieldOp>(block.getTerminator());
+    auto terminator = dyn_cast<impulse::YieldOp>(block.getTerminator());
     if (!terminator)
       continue;
     OpBuilder replacer(terminator);
@@ -747,7 +760,7 @@ static FailureOr<func::FuncOp> outlineRegionToFunction(Region &region,
   return outlinedFunc;
 }
 
-static bool canOutlineLogpdf(enzyme::MCMCRegionOp regionOp) {
+static bool canOutlineLogpdf(impulse::MCMCRegionOp regionOp) {
   Region &logpdf = regionOp.getLogpdf();
   if (logpdf.empty())
     return false;
@@ -766,7 +779,7 @@ static bool canOutlineLogpdf(enzyme::MCMCRegionOp regionOp) {
   return true;
 }
 
-static LogicalResult outlineLogpdfToFunction(enzyme::MCMCRegionOp regionOp,
+static LogicalResult outlineLogpdfToFunction(impulse::MCMCRegionOp regionOp,
                                              StringRef logpdfFuncName,
                                              OpBuilder &builder) {
   Location loc = regionOp.getLoc();
@@ -819,10 +832,10 @@ static LogicalResult outlineLogpdfToFunction(enzyme::MCMCRegionOp regionOp,
         builder, loc, i64TensorType,
         DenseElementsAttr::get(i64TensorType,
                                builder.getI64IntegerAttr(curOffset)));
-    auto slice = enzyme::DynamicSliceOp::create(
+    auto slice = impulse::DynamicSliceOp::create(
         builder, loc, sliceType, flatPosition, ValueRange{c0, offsetConst},
         builder.getDenseI64ArrayAttr({1, numElements}));
-    auto component = enzyme::ReshapeOp::create(builder, loc, posArgType, slice);
+    auto component = impulse::ReshapeOp::create(builder, loc, posArgType, slice);
 
     logpdfMapping.map(logpdfEntry.getArgument(i), component);
     curOffset += numElements;
@@ -838,7 +851,7 @@ static LogicalResult outlineLogpdfToFunction(enzyme::MCMCRegionOp regionOp,
   return success();
 }
 
-static Value computeInitialPositionFromTrace(enzyme::MCMCRegionOp regionOp,
+static Value computeInitialPositionFromTrace(impulse::MCMCRegionOp regionOp,
                                              OpBuilder &builder) {
   Location loc = regionOp.getLoc();
   auto elemType = builder.getF64Type();
@@ -849,8 +862,8 @@ static Value computeInitialPositionFromTrace(enzyme::MCMCRegionOp regionOp,
 
   DenseMap<Attribute, std::pair<int64_t, int64_t>> traceOffsets;
   {
-    DenseMap<Attribute, enzyme::SampleRegionOp> symbolToOp;
-    regionOp.getSampler().walk([&](enzyme::SampleRegionOp sampleOp) {
+    DenseMap<Attribute, impulse::SampleRegionOp> symbolToOp;
+    regionOp.getSampler().walk([&](impulse::SampleRegionOp sampleOp) {
       if (auto sym = sampleOp.getSymbolAttr())
         symbolToOp[sym] = sampleOp;
     });
@@ -911,10 +924,10 @@ static Value computeInitialPositionFromTrace(enzyme::MCMCRegionOp regionOp,
         DenseElementsAttr::get(i64TensorType,
                                builder.getI64IntegerAttr(posOffset)));
 
-    auto traceSlice = enzyme::DynamicSliceOp::create(
+    auto traceSlice = impulse::DynamicSliceOp::create(
         builder, loc, sliceType, trace, ValueRange{c0, traceOffConst},
         builder.getDenseI64ArrayAttr({1, size}));
-    result = enzyme::DynamicUpdateSliceOp::create(builder, loc, positionType,
+    result = impulse::DynamicUpdateSliceOp::create(builder, loc, positionType,
                                                   result, traceSlice,
                                                   ValueRange{c0, posOffConst});
 
@@ -924,7 +937,7 @@ static Value computeInitialPositionFromTrace(enzyme::MCMCRegionOp regionOp,
   return result;
 }
 
-LogicalResult outlineMCMCRegion(enzyme::MCMCRegionOp regionOp,
+LogicalResult outlineMCMCRegion(impulse::MCMCRegionOp regionOp,
                                 StringRef funcName, OpBuilder &builder) {
   OpBuilder::InsertionGuard insertionGuard(builder);
 
@@ -949,16 +962,21 @@ LogicalResult outlineMCMCRegion(enzyme::MCMCRegionOp regionOp,
     mcmcInputs.push_back(regionOp.getInputs()[0]); // rng
     mcmcInputs.append(logpdfFreeValues.begin(), logpdfFreeValues.end());
 
-    auto newOp = enzyme::MCMCOp::create(
+    auto newOp = impulse::InferOp::create(
         builder, regionOp.getLoc(), regionOp.getResultTypes(),
         /*fn=*/FlatSymbolRefAttr{}, mcmcInputs,
+        /*adaptation_state_in=*/ValueRange{},
         /*original_trace=*/Value(), regionOp.getSelectionAttr(),
         regionOp.getAllAddressesAttr(), regionOp.getNumWarmupAttr(),
         regionOp.getNumSamplesAttr(), regionOp.getThinningAttr(),
+        /*total_warmup=*/IntegerAttr{},
         regionOp.getInverseMassMatrix(), regionOp.getStepSize(),
         regionOp.getHmcConfigAttr(), regionOp.getNutsConfigAttr(), logpdfSymRef,
         initialPosition, regionOp.getInitialGradient(),
-        regionOp.getInitialPotentialEnergy(), regionOp.getNameAttr());
+        regionOp.getInitialPotentialEnergy(),
+        /*warmup_offset=*/Value{},
+        /*autodiff_attrs=*/DictionaryAttr{},
+        regionOp.getNameAttr());
 
     regionOp.replaceAllUsesWith(newOp.getResults());
     regionOp.erase();
@@ -989,15 +1007,20 @@ LogicalResult outlineMCMCRegion(enzyme::MCMCRegionOp regionOp,
   FlatSymbolRefAttr logpdfAttr =
       isLogpdfMode ? outlinedSymRef : regionOp.getLogpdfFnAttr();
 
-  auto newOp = enzyme::MCMCOp::create(
+  auto newOp = impulse::InferOp::create(
       builder, regionOp.getLoc(), regionOp.getResultTypes(), fnAttr, allInputs,
+      /*adaptation_state_in=*/ValueRange{},
       regionOp.getOriginalTrace(), regionOp.getSelectionAttr(),
       regionOp.getAllAddressesAttr(), regionOp.getNumWarmupAttr(),
       regionOp.getNumSamplesAttr(), regionOp.getThinningAttr(),
+      /*total_warmup=*/IntegerAttr{},
       regionOp.getInverseMassMatrix(), regionOp.getStepSize(),
       regionOp.getHmcConfigAttr(), regionOp.getNutsConfigAttr(), logpdfAttr,
       regionOp.getInitialPosition(), regionOp.getInitialGradient(),
-      regionOp.getInitialPotentialEnergy(), regionOp.getNameAttr());
+      regionOp.getInitialPotentialEnergy(),
+      /*warmup_offset=*/Value{},
+      /*autodiff_attrs=*/DictionaryAttr{},
+      regionOp.getNameAttr());
 
   regionOp.replaceAllUsesWith(newOp.getResults());
   regionOp.erase();
@@ -1013,9 +1036,9 @@ struct InlineMCMCIntoRegion
     GreedyRewriteConfig config;
     (void)applyPatternsGreedily(getOperation(), std::move(patterns), config);
 
-    SmallVector<enzyme::MCMCRegionOp> regionOps;
+    SmallVector<impulse::MCMCRegionOp> regionOps;
     getOperation()->walk(
-        [&](enzyme::MCMCRegionOp op) { regionOps.push_back(op); });
+        [&](impulse::MCMCRegionOp op) { regionOps.push_back(op); });
 
     for (auto regionOp : regionOps) {
       bool submodelChanged = true;
@@ -1031,9 +1054,9 @@ struct OutlineMCMCFromRegion
     : public enzyme::impl::OutlineMCMCFromRegionPassBase<
           OutlineMCMCFromRegion> {
   void runOnOperation() override {
-    SmallVector<enzyme::MCMCRegionOp> toOutline;
+    SmallVector<impulse::MCMCRegionOp> toOutline;
     getOperation()->walk(
-        [&](enzyme::MCMCRegionOp op) { toOutline.push_back(op); });
+        [&](impulse::MCMCRegionOp op) { toOutline.push_back(op); });
 
     OpBuilder builder(getOperation());
     unsigned increment = 0;

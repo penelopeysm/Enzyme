@@ -1,6 +1,7 @@
 #ifndef ENZYME_MLIR_ANALYSIS_SAMPLEDEPENDENCEANALYSIS_H
 #define ENZYME_MLIR_ANALYSIS_SAMPLEDEPENDENCEANALYSIS_H
 
+#include "Dialect/Impulse/Impulse.h"
 #include "Dialect/Ops.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
@@ -17,17 +18,18 @@ enum class AnalysisTarget {
 
 class SampleDependenceAnalysis {
 public:
-  explicit SampleDependenceAnalysis(MCMCRegionOp regionOp);
+  explicit SampleDependenceAnalysis(impulse::MCMCRegionOp regionOp);
 
-  SampleDependenceAnalysis(MCMCRegionOp regionOp, AnalysisTarget target);
+  SampleDependenceAnalysis(impulse::MCMCRegionOp regionOp,
+                           AnalysisTarget target);
 
   bool isSampleDependent(Value value) const;
   bool isSampleDependent(Operation *op) const;
   bool canHoist(Operation *op) const;
 
-  ArrayRef<SampleRegionOp> getSampleOps() const { return sampleOps; }
+  ArrayRef<impulse::SampleRegionOp> getSampleOps() const { return sampleOps; }
 
-  MCMCRegionOp getRegionOp() const { return regionOp; }
+  impulse::MCMCRegionOp getRegionOp() const { return regionOp; }
   AnalysisTarget getTarget() const { return target; }
 
   bool isInTargetRegion(Operation *op);
@@ -35,10 +37,10 @@ public:
   Region &getTargetRegion();
 
 private:
-  MCMCRegionOp regionOp;
+  impulse::MCMCRegionOp regionOp;
   AnalysisTarget target;
   DenseSet<Value> sampleDependentValues;
-  SmallVector<SampleRegionOp> sampleOps;
+  SmallVector<impulse::SampleRegionOp> sampleOps;
 
   void runSamplerAnalysis();
   void runLogpdfAnalysis();
@@ -46,11 +48,12 @@ private:
   void propagateDependence(Region &region);
 };
 
-bool hoistSampleInvariantOps(MCMCRegionOp regionOp);
+bool hoistSampleInvariantOps(impulse::MCMCRegionOp regionOp);
 
-bool hoistSampleInvariantOps(MCMCRegionOp regionOp, AnalysisTarget target);
+bool hoistSampleInvariantOps(impulse::MCMCRegionOp regionOp,
+                             AnalysisTarget target);
 
-bool constructUnifiedLogpdf(MCMCRegionOp regionOp);
+bool constructUnifiedLogpdf(impulse::MCMCRegionOp regionOp);
 
 } // namespace enzyme
 } // namespace mlir

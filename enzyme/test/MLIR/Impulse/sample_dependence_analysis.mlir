@@ -12,19 +12,19 @@
 
 // Operations inside sampler region (nested in sample_region)
 // CHECK: [INV] [HOIST] arith.addf -> tensor<f64>
-// CHECK: [INV] [KEEP]  enzyme.yield
+// CHECK: [INV] [KEEP]  impulse.yield
 
 // Per-site logpdf bodies are merged into MCMCRegionOp's unified logpdf
 // region by inline-mcmc-regions Phase 2, so arith.negf no longer appears here.
 
 // The sample_region itself - sample-dependent
-// CHECK: [DEP] [KEEP]  enzyme.sample_region -> tensor<2xui64>, tensor<f64>
+// CHECK: [DEP] [KEEP]  impulse.sample_region -> tensor<2xui64>, tensor<f64>
 
 // Operations after sample that depend on sample result
 // CHECK: [DEP] [KEEP]  arith.mulf -> tensor<f64>
 
 // Terminator - invariant but must stay
-// CHECK: [INV] [KEEP]  enzyme.yield
+// CHECK: [INV] [KEEP]  impulse.yield
 
 // CHECK: === End SampleDependenceAnalysis ===
 
@@ -42,21 +42,21 @@ module {
   }
 
   func.func @test_basic(%rng : tensor<2xui64>, %prior_mean : tensor<f64>, %trace : tensor<1x1xf64>)
-      -> (tensor<1x1xf64>, tensor<1xi1>, tensor<2xui64>) {
+      -> (tensor<1x1xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>) {
     %step_size = arith.constant dense<0.1> : tensor<f64>
 
-    %result:8 = enzyme.mcmc @model_basic(%rng, %prior_mean) given %trace
+    %result:9 = impulse.infer @model_basic(%rng, %prior_mean) given %trace
         step_size = %step_size {
-      selection = [[#enzyme.symbol<1>]],
-      all_addresses = [[#enzyme.symbol<1>]],
-      hmc_config = #enzyme.hmc_config<trajectory_length = 1.0>,
+      selection = [[#impulse.symbol<1>]],
+      all_addresses = [[#impulse.symbol<1>]],
+      hmc_config = #impulse.hmc_config<trajectory_length = 1.0>,
       num_samples = 1 : i64,
       thinning = 1 : i64,
       num_warmup = 0 : i64
     } : (tensor<2xui64>, tensor<f64>, tensor<1x1xf64>, tensor<f64>)
-        -> (tensor<1x1xf64>, tensor<1xi1>, tensor<2xui64>, tensor<1x1xf64>, tensor<1x1xf64>, tensor<f64>, tensor<f64>, tensor<1x1xf64>)
+        -> (tensor<1x1xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>, tensor<1x1xf64>, tensor<1x1xf64>, tensor<f64>, tensor<f64>, tensor<1x1xf64>)
 
-    return %result#0, %result#1, %result#2 : tensor<1x1xf64>, tensor<1xi1>, tensor<2xui64>
+    return %result#0, %result#1, %result#2, %result#3 : tensor<1x1xf64>, tensor<1x2xi1>, tensor<1xf64>, tensor<2xui64>
   }
 
   func.func @model_basic(%rng : tensor<2xui64>, %prior_mean : tensor<f64>)
@@ -68,9 +68,9 @@ module {
     %twice_mean = arith.mulf %prior_mean, %two : tensor<f64>
 
     // Sample-dependent: sample_region itself
-    %x:2 = enzyme.sample @normal(%rng, %twice_mean, %std) {
+    %x:2 = impulse.sample @normal(%rng, %twice_mean, %std) {
       logpdf = @normal_logpdf,
-      symbol = #enzyme.symbol<1>
+      symbol = #impulse.symbol<1>
     } : (tensor<2xui64>, tensor<f64>, tensor<f64>) -> (tensor<2xui64>, tensor<f64>)
 
     // Sample-dependent: depends on sample result

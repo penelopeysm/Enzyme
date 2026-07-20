@@ -72,6 +72,8 @@ def SupportAttr : Impulse_Attr<"Support", "support"> {
   let assemblyFormat = "`<` $kind (`,` `lower` `=` $lower_bound^)? (`,` `upper` `=` $upper_bound^)? `>`";
 }
 
+def SupportArrayAttr : TypedArrayAttrBase<SupportAttr, "Array of support specifications">;
+
 def HMCConfigAttr : Impulse_Attr<"HMCConfig", "hmc_config"> {
   let summary = "Configuration for HMC inference";
   let description = [{
