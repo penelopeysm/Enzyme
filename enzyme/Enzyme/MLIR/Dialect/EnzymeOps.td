@@ -23,7 +23,6 @@ include "mlir/IR/AttrTypeBase.td"
 
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/FunctionInterfaces.td"
-include "mlir/Interfaces/LoopLikeInterface.td"
 include "mlir/Interfaces/MemorySlotInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Dialect/Arith/IR/ArithBase.td"
@@ -161,6 +160,17 @@ def AutoDiffOp : Enzyme_Op<"autodiff",
   }];
 }
 
+def JacobianOp : Enzyme_Op<"jacobian",
+    [DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "Compute Jacobian for a function";
+  let arguments = (ins FlatSymbolRefAttr:$fn, Variadic<AnyType>:$inputs, ActivityArrayAttr:$activity, ActivityArrayAttr:$ret_activity, DefaultValuedAttr<I64Attr, "1">:$width, DefaultValuedAttr<BoolAttr, "false">:$strong_zero);
+  let results = (outs Variadic<AnyType>:$outputs);
+
+  let assemblyFormat = [{
+    $fn `(` $inputs `)` attr-dict `:` functional-type($inputs, results)
+  }];
+}
+
 def AutoDiffRegionOp : Enzyme_Op<"autodiff_region", [AutomaticAllocationScope]> {
   let summary = "Perform reverse mode AD on a child region";
   let arguments = (ins Variadic<AnyType>:$inputs, ActivityArrayAttr:$activity, ActivityArrayAttr:$ret_activity, DefaultValuedAttr<I64Attr, "1">:$width, DefaultValuedAttr<BoolAttr, "false">:$strong_zero, OptionalAttr<StrAttr>:$fn);
@@ -228,38 +238,11 @@ def ForwardDiffRegionOp : Enzyme_Op<"fwddiff_region", [AutomaticAllocationScope]
 }
 
 def YieldOp : Enzyme_Op<"yield", [Pure, ReturnLike, Terminator,
-    ParentOneOf<["AutoDiffRegionOp", "ForwardDiffRegionOp", "ForLoopOp", "WhileLoopOp", "IfOp", "MCMCRegionOp", "SampleRegionOp"]>]> {
-  let summary = "Yield values at the end of an autodiff_region, loop, or if ops";
+    ParentOneOf<["AutoDiffRegionOp", "ForwardDiffRegionOp", "MCMCRegionOp", "SampleRegionOp"]>]> {
+  let summary = "Yield values at the end of an autodiff_region";
   let arguments = (ins Variadic<AnyType>:$operands);
   let assemblyFormat = [{
     attr-dict ($operands^ `:` type($operands))?
-  }];
-}
-
-def ForLoopOp : Enzyme_Op<"for_loop", [AutomaticAllocationScope]> {
-  let summary = "Counted loop for probabilistic programming";
-  let description = [{
-    A counted loop operation that iterates from `lowerBound` to `upperBound`
-    by `step`, carrying `iter_args` through each iteration. The iteration
-    variable and iter_args are passed to the body region.
-  }];
-
-  let arguments = (ins
-    AnyType:$lowerBound,
-    AnyType:$upperBound,
-    AnyType:$step,
-    Variadic<AnyType>:$initArgs
-  );
-
-  let regions = (region SizedRegion<1>:$region);
-  let results = (outs Variadic<AnyType>:$results);
-
-  let assemblyFormat = [{
-    `(` $lowerBound `:` type($lowerBound) `)`
-    `to` `(` $upperBound `:` type($upperBound) `)`
-    `step` `(` $step `:` type($step) `)`
-    (`iter_args` `(` $initArgs^ `:` type($initArgs) `)`)?
-    `->` type(results) $region attr-dict
   }];
 }
 
@@ -1053,87 +1036,6 @@ def AffineAtomicRMWOp : Enzyme_Op<"affine_atomic_rmw"> {
   let assemblyFormat = [{
     $kind $value `,` $memref `,` `(` $map `)` `[` $indices `]` attr-dict `:` `(` type($value) `,`
     type($memref) `)` `->` type($result)
-  }];
-}
-
-def WhileLoopOp : Enzyme_Op<"while_loop", [AutomaticAllocationScope]> {
-  let summary = "While loop with condition";
-  let description = [{
-    A while loop operation that continues iterating as long as the condition
-    evaluates to true. Intended to be lowered to `stablehlo.while`.
-  }];
-
-  let arguments = (ins Variadic<AnyType>:$initArgs);
-  let regions = (region SizedRegion<1>:$conditionRegion,
-                        SizedRegion<1>:$bodyRegion);
-  let results = (outs Variadic<AnyType>:$results);
-
-  let assemblyFormat = [{
-    `(` $initArgs `:` type($initArgs) `)`
-    `->` type(results)
-    `condition` $conditionRegion
-    `body` $bodyRegion
-    attr-dict
-  }];
-}
-
-def IfOp : Enzyme_Op<"if", [AutomaticAllocationScope, RecursiveMemoryEffects]> {
-  let summary = "Conditional execution with two branches";
-  let description = [{
-    A conditional operation that executes exactly one of two branches based on a
-    boolean predicate.
-  }];
-
-  let arguments = (ins AnyType:$predicate);
-  let regions = (region SizedRegion<1>:$trueBranch,
-                        SizedRegion<1>:$falseBranch);
-  let results = (outs Variadic<AnyType>:$results);
-
-  let assemblyFormat = [{
-    `(` $predicate `)` `(` $trueBranch `,` $falseBranch `)`
-    attr-dict `:` functional-type($predicate, results)
-  }];
-}
-
-def LogAddExpOp : Enzyme_Op<"log_add_exp", [Pure]> {
-  let summary = "Computes log(exp(x) + exp(y))";
-  let description = [{
-    Computes log(exp(x) + exp(y)).
-  }];
-
-  let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs);
-  let results = (outs AnyRankedTensor:$result);
-
-  let assemblyFormat = [{
-    $lhs `,` $rhs attr-dict `:` functional-type(operands, results)
-  }];
-}
-
-def LogisticOp : Enzyme_Op<"logistic", [Pure]> {
-  let summary = "Computes logistic (sigmoid) function: 1 / (1 + exp(-x))";
-  let description = [{
-    Computes the logistic (sigmoid) function: 1 / (1 + exp(-x)).
-  }];
-
-  let arguments = (ins AnyRankedTensor:$operand);
-  let results = (outs AnyRankedTensor:$result);
-
-  let assemblyFormat = [{
-    $operand attr-dict `:` functional-type(operands, results)
-  }];
-}
-
-def PopcountOp : Enzyme_Op<"popcount", [Pure, SameOperandsAndResultElementType, SameOperandsAndResultShape]> {
-  let summary = "Computes population count";
-  let description = [{
-    Returns the number of 1-bits elementwise.
-  }];
-
-  let arguments = (ins AnyRankedTensor:$operand);
-  let results = (outs AnyRankedTensor:$result);
-
-  let assemblyFormat = [{
-    $operand attr-dict `:` functional-type(operands, results)
   }];
 }
 

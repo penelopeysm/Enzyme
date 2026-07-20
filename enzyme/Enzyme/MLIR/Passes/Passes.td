@@ -19,6 +19,8 @@ def DifferentiatePass : Pass<"enzyme"> {
     "cf::ControlFlowDialect",
     "tensor::TensorDialect",
     "enzyme::EnzymeDialect",
+    "linalg::LinalgDialect",
+    "memref::MemRefDialect"
   ];
   let options = [
     Option<
@@ -38,12 +40,13 @@ def DifferentiatePass : Pass<"enzyme"> {
   ];
 }
 
-def ProbProgPass : Pass<"probprog"> {
-  let summary = "ProbProg Passes";
+def ExpandImpulsePass : Pass<"expand-impulse"> {
+  let summary = "Materialize Impulse ops to probabilistic programming algorithms";
   let dependentDialects = [
     "arith::ArithDialect",
     "complex::ComplexDialect",
     "enzyme::EnzymeDialect",
+    "impulse::ImpulseDialect",
   ];
   let options = [
     Option<
@@ -51,7 +54,7 @@ def ProbProgPass : Pass<"probprog"> {
       /*CLI argument=*/"postpasses",
       /*type=*/"std::string",
       /*default=*/"",
-      /*description=*/"Optimization passes to apply to generated probabilistic programs"
+      /*description=*/"Optimization passes to apply to expanded probabilistic programs"
     >,
     Option<
       /*C++ variable name=*/"debugDump",
@@ -78,13 +81,38 @@ def BatchDiffPass : Pass<"enzyme-diff-batch">{
   ];
 }
 
+def EnzymeActivityOpt : Pass<"enzyme-activity-opt">{
+  let summary = "Optimize activity for differentiation";
+  let dependentDialects = [
+    "enzyme::EnzymeDialect",
+  ];
+  let options = [
+    Option<
+      /*C++ variable name=*/"dataflow",
+      /*CLI argument=*/"dataflow",
+      /*type=*/"bool",
+      /*default=*/"false",
+      /*description=*/"Whether to use the new Dataflow activity analysis"
+    >,
+    Option<
+      /*C++ variable name=*/"printActivityAnalysis",
+      /*CLI argument=*/"print",
+      /*type=*/"bool",
+      /*default=*/"false",
+      /*description=*/"Print the dataflow activity analysis results used by the optimizer"
+    >,
+  ];
+}
+
 def DifferentiateWrapperPass : Pass<"enzyme-wrap"> {
   let summary = "Add wrapper function to be differentiated";
   let dependentDialects = [
     "arith::ArithDialect",
     "complex::ComplexDialect",
     "cf::ControlFlowDialect",
-    "enzyme::EnzymeDialect"
+    "enzyme::EnzymeDialect",
+    "linalg::LinalgDialect",
+    "memref::MemRefDialect"
   ];
   let options = [
     Option<

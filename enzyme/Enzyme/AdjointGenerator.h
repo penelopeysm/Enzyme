@@ -276,6 +276,13 @@ public:
       break;
     }
 
+    if (gutils->isConstantInstruction(&inst)) {
+      if (Mode == DerivativeMode::ReverseModePrimal)
+        return;
+      eraseIfUnused(inst);
+      return;
+    }
+
     std::string s;
     llvm::raw_string_ostream ss(s);
     ss << "in Mode: " << to_string(Mode) << "\n";
@@ -325,7 +332,7 @@ public:
     IRBuilder<> Builder2(&I);
     getForwardBuilder(Builder2);
 
-    auto toset = gutils->invertPointerM(&I, Builder2, /*nullShadow*/ true);
+    auto toset = gutils->invertPointerM(&I, Builder2);
 
     assert(toset != placeholder);
 
@@ -568,14 +575,16 @@ public:
       // we can pre initialize all the knownRecomputeHeuristic values to false
       // (not needing) as we may assume that minCutCache already preserves
       // everything it requires.
-      std::map<UsageKey, bool> Seen;
+      std::map<UsageKey, bool> Seen = gutils->populateSeenFromKnownRecompute();
       bool primalNeededInReverse = false;
-      for (auto pair : gutils->knownRecomputeHeuristic)
-        if (!pair.second) {
-          Seen[UsageKey(pair.first, QueryType::Primal)] = false;
-          if (pair.first == &I)
+      {
+        auto found = gutils->knownRecomputeHeuristic.find(&I);
+        if (found != gutils->knownRecomputeHeuristic.end()) {
+          if (!found->second) {
             primalNeededInReverse = true;
+          }
         }
+      }
       auto cacheMode = (Mode == DerivativeMode::ReverseModePrimal)
                            ? DerivativeMode::ReverseModeGradient
                            : Mode;
@@ -780,7 +789,8 @@ public:
                 : gutils->invertPointerM(I.getPointerOperand(), BuilderZ),
             gutils->isConstantValue(I.getValOperand())
                 ? nullptr
-                : gutils->invertPointerM(I.getValOperand(), BuilderZ));
+                : gutils->invertPointerM(I.getValOperand(), BuilderZ,
+                                         TR.query(&I)));
         if (!gutils->isConstantValue(&I))
           setDiffe(&I, diff, BuilderZ);
         return;
@@ -834,8 +844,8 @@ public:
       auto &DL = gutils->newFunc->getParent()->getDataLayout();
       auto valType = I.getValOperand()->getType();
       auto storeSize = DL.getTypeSizeInBits(valType) / 8;
-      auto fp = TR.firstPointer(storeSize, I.getPointerOperand(), &I,
-                                /*errifnotfound*/ false,
+      auto fp = TR.firstPointer(storeSize, I.getPointerOperand(), &I, gutils,
+                                /*errifnotfound*/ nullptr,
                                 /*pointerIntSame*/ true);
       if (!fp.isKnown() && valType->isIntOrIntVectorTy()) {
         if (Mode == DerivativeMode::ReverseModeGradient ||
@@ -900,7 +910,8 @@ public:
         // However, if we are rematerailizing the allocationa and not
         // inside the loop level rematerialization, we do still need the
         // reverse passes ``fake primal'' store and therefore write barrier
-        if (pair.second.stores.count(&SI) &&
+        if (gutils->allocationsToBeRematerialized.count(pair.first) &&
+            pair.second.stores.count(&SI) &&
             (!pair.second.LI || !pair.second.LI->contains(&SI))) {
           forceErase = false;
         }
@@ -988,27 +999,38 @@ public:
     if (Mode == DerivativeMode::ForwardMode ||
         Mode == DerivativeMode::ForwardModeError) {
 
-      auto dt = vd[{-1}];
+      bool anyPointer = false;
       // Only need the full type in forward mode, if storing a constant
       // and therefore may need to zero some floats.
-      if (constantval)
-        for (size_t i = 0; i < storeSize; ++i) {
-          bool Legal = true;
-          dt.checkedOrIn(vd[{(int)i}], /*PointerIntSame*/ true, Legal);
-          if (!Legal) {
-            std::string str;
-            raw_string_ostream ss(str);
-            ss << "Cannot deduce single type of store " << I << vd.str()
-               << " size: " << storeSize;
-            EmitNoTypeError(str, I, gutils, BuilderZ);
-            return;
+      if (constantval) {
+        for (size_t i = 0; i < storeSize;) {
+          if (auto flt = vd[{(int)i}].isFloat()) {
+            i += DL.getTypeSizeInBits(flt) / 8;
+            continue;
           }
+          if (vd[{(int)i}] == BaseType::Pointer) {
+            anyPointer = true;
+            i += DL.getPointerSizeInBits() / 8;
+            continue;
+          }
+          if (vd[{(int)i}] == BaseType::Integer ||
+              vd[{(int)i}] == BaseType::Anything) {
+            i++;
+            continue;
+          }
+          std::string str;
+          raw_string_ostream ss(str);
+          ss << "Cannot deduce type of store " << I << vd.str()
+             << " size: " << storeSize << " at " << i;
+          EmitNoTypeError(str, I, gutils, BuilderZ);
+          return;
         }
+      }
 
       Value *diff = nullptr;
       bool needs_writebarrier = false;
       if (!gutils->runtimeActivity && constantval) {
-        if (dt.isPossiblePointer() && vd[{-1, -1}] != BaseType::Integer) {
+        if (anyPointer && vd[{-1, -1}] != BaseType::Integer) {
           if (!isa<UndefValue>(orig_val) &&
               !isa<ConstantPointerNull>(orig_val)) {
             std::string str;
@@ -1029,16 +1051,7 @@ public:
 
       // TODO type analyze
       if (!diff) {
-        if (!constantval)
-          diff =
-              gutils->invertPointerM(orig_val, BuilderZ, /*nullShadow*/ true);
-        else if (orig_val->getType()->isPointerTy() ||
-                 dt == BaseType::Pointer || dt == BaseType::Integer)
-          diff =
-              gutils->invertPointerM(orig_val, BuilderZ, /*nullShadow*/ false);
-        else
-          diff =
-              gutils->invertPointerM(orig_val, BuilderZ, /*nullShadow*/ true);
+        diff = gutils->invertPointerM(orig_val, BuilderZ, vd);
       }
 
       gutils->setPtrDiffe(&I, orig_ptr, diff, BuilderZ, prevalign, 0, storeSize,
@@ -1218,8 +1231,7 @@ public:
 
           Value *diff = constantval
                             ? Constant::getNullValue(diffeTy)
-                            : gutils->invertPointerM(orig_val, BuilderZ,
-                                                     /*nullShadow*/ true);
+                            : gutils->invertPointerM(orig_val, BuilderZ, vd);
           gutils->setPtrDiffe(&I, orig_ptr, diff, BuilderZ, align, start, size,
                               isVolatile, ordering, syncScope, mask,
                               prevNoAlias, prevScopes);
@@ -1255,6 +1267,15 @@ public:
               if (!forwardsShadow && pair.second.LI &&
                   pair.second.LI->contains(inst->getParent()))
                 backwardsShadow = false;
+          }
+        }
+
+        if (auto arg = dyn_cast<Argument>(getBaseObject(orig_ptr))) {
+          unsigned argNo = arg->getArgNo();
+          if (argNo < gutils->nowrite_shadows.size() &&
+              gutils->nowrite_shadows[argNo]) {
+            forwardsShadow = false;
+            backwardsShadow = false;
           }
         }
 
@@ -1301,7 +1322,7 @@ public:
               }
             }
           } else {
-            valueop = gutils->invertPointerM(orig_val, BuilderZ);
+            valueop = gutils->invertPointerM(orig_val, BuilderZ, vd);
           }
           gutils->setPtrDiffe(&I, orig_ptr, valueop, BuilderZ, align, start,
                               size, isVolatile, ordering, syncScope, mask,
@@ -1958,30 +1979,42 @@ public:
       return;
 
     bool floatingInsertion = false;
-    for (InsertValueInst *iv = &IVI;;) {
-      size_t size0 = 1;
-      if (iv->getInsertedValueOperand()->getType()->isSized() &&
-          (iv->getInsertedValueOperand()->getType()->isIntOrIntVectorTy() ||
-           iv->getInsertedValueOperand()->getType()->isFPOrFPVectorTy()))
-        size0 =
-            (gutils->newFunc->getParent()->getDataLayout().getTypeSizeInBits(
-                 iv->getInsertedValueOperand()->getType()) +
-             7) /
-            8;
-      auto it = TR.intType(size0, iv->getInsertedValueOperand(), false);
-      if (it.isFloat() || !it.isKnown()) {
-        floatingInsertion = true;
-        break;
+    if (auto MD = hasMetadata(&IVI, "enzyme_truetype")) {
+      auto toIterate = parseTrueType(MD, Mode, false);
+      for (auto &tuple : toIterate) {
+        Type *ty = std::get<0>(tuple);
+        if (ty && ty->isFloatingPointTy()) {
+          floatingInsertion = true;
+          break;
+        }
       }
-      Value *val = iv->getAggregateOperand();
-      if (gutils->isConstantValue(val))
-        break;
-      if (auto dc = dyn_cast<InsertValueInst>(val)) {
-        iv = dc;
-      } else {
-        // unsure where this came from, conservatively assume contains float
-        floatingInsertion = true;
-        break;
+    } else {
+      for (InsertValueInst *iv = &IVI;;) {
+        size_t size0 = 1;
+        if (iv->getInsertedValueOperand()->getType()->isSized() &&
+            (iv->getInsertedValueOperand()->getType()->isIntOrIntVectorTy() ||
+             iv->getInsertedValueOperand()->getType()->isFPOrFPVectorTy()))
+          size0 =
+              (gutils->newFunc->getParent()->getDataLayout().getTypeSizeInBits(
+                   iv->getInsertedValueOperand()->getType()) +
+               7) /
+              8;
+        auto it = TR.intType(size0, iv->getInsertedValueOperand(), iv, gutils,
+                             /*err*/ nullptr);
+        if (it.isFloat() || !it.isKnown()) {
+          floatingInsertion = true;
+          break;
+        }
+        Value *val = iv->getAggregateOperand();
+        if (gutils->isConstantValue(val))
+          break;
+        if (auto dc = dyn_cast<InsertValueInst>(val)) {
+          iv = dc;
+        } else {
+          // unsure where this came from, conservatively assume contains float
+          floatingInsertion = true;
+          break;
+        }
       }
     }
 
@@ -2092,6 +2125,7 @@ public:
       if (!gutils->isConstantValue(orig_agg)) {
 
         auto TT = TR.query(orig_agg);
+        const MDNode *MD = hasMetadata(&IVI, "enzyme_truetype");
 
         unsigned start = 0;
 
@@ -2103,6 +2137,22 @@ public:
           auto dt = TT[{-1}];
           for (size_t i = start; i < size1; ++i) {
             auto nex = TT[{(int)i}];
+            if (MD) {
+              for (size_t j = 0; j < MD->getNumOperands(); j += 2) {
+                ConcreteType base(
+                    llvm::cast<llvm::MDString>(MD->getOperand(j))->getString(),
+                    MD->getContext());
+                auto offset = llvm::cast<llvm::ConstantInt>(
+                                  llvm::cast<llvm::ConstantAsMetadata>(
+                                      MD->getOperand(j + 1))
+                                      ->getValue())
+                                  ->getSExtValue();
+                if (offset == (int64_t)i) {
+                  nex = base;
+                  break;
+                }
+              }
+            }
             if ((nex == BaseType::Anything && dt.isFloat()) ||
                 (dt == BaseType::Anything && nex.isFloat())) {
               nextStart = i;
@@ -2419,12 +2469,20 @@ public:
       }
       goto def;
     }
+    case Instruction::AShr: {
+      if (looseTypeAnalysis) {
+        llvm::errs() << "warning: binary operator is integer and constant: "
+                     << BO << "\n";
+        // if loose type analysis, assume this integer and is constant
+        return;
+      }
+      goto def;
+    }
     case Instruction::And: {
       // If & against 0b10000000000 and a float the result is 0
       auto &dl = gutils->oldFunc->getParent()->getDataLayout();
-      auto size = dl.getTypeSizeInBits(BO.getType()) / 8;
 
-      auto FT = TR.query(&BO).IsAllFloat(size, dl);
+      auto FT = TR.query(&BO).allFloat(&BO, dl);
       auto eFT = FT;
       if (FT)
         for (int i = 0; i < 2; ++i) {
@@ -2452,9 +2510,8 @@ public:
     }
     case Instruction::Xor: {
       auto &dl = gutils->oldFunc->getParent()->getDataLayout();
-      auto size = dl.getTypeSizeInBits(BO.getType()) / 8;
 
-      auto FT = TR.query(&BO).IsAllFloat(size, dl);
+      auto FT = TR.query(&BO).allFloat(&BO, dl);
       auto eFT = FT;
       // If ^ against 0b10000000000 and a float the result is a float
       if (FT)
@@ -2490,9 +2547,8 @@ public:
     }
     case Instruction::Or: {
       auto &dl = gutils->oldFunc->getParent()->getDataLayout();
-      auto size = dl.getTypeSizeInBits(BO.getType()) / 8;
 
-      auto FT = TR.query(&BO).IsAllFloat(size, dl);
+      auto FT = TR.query(&BO).allFloat(&BO, dl);
       auto eFT = FT;
       // If & against 0b10000000000 and a float the result is a float
       if (FT)
@@ -2519,14 +2575,14 @@ public:
               validXor = true;
             } else if (
                 !AP.isNegative() &&
-                ((FT->isFloatTy()
+                ((eFT->isFloatTy()
 #if LLVM_VERSION_MAJOR > 16
                   && (AP & ~0b01111111100000000000000000000000ULL).isZero()
 #else
                   && (AP & ~0b01111111100000000000000000000000ULL).isNullValue()
 #endif
                       ) ||
-                 (FT->isDoubleTy()
+                 (eFT->isDoubleTy()
 #if LLVM_VERSION_MAJOR > 16
                   &&
                   (AP &
@@ -2555,10 +2611,10 @@ public:
                 prev = Builder2.CreateSub(prev, arg, "", /*NUW*/ true,
                                           /*NSW*/ false);
                 uint64_t num = 0;
-                if (FT->isFloatTy()) {
+                if (eFT->isFloatTy()) {
                   num = 127ULL << 23;
                 } else {
-                  assert(FT->isDoubleTy());
+                  assert(eFT->isDoubleTy());
                   num = 1023ULL << 52;
                 }
                 prev = Builder2.CreateAdd(
@@ -2587,6 +2643,9 @@ public:
       }
       goto def;
     }
+    case Instruction::UDiv:
+    case Instruction::URem:
+    case Instruction::SRem:
     case Instruction::SDiv:
     case Instruction::Shl:
     case Instruction::Mul:
@@ -2655,10 +2714,9 @@ public:
     case Instruction::And: {
       // If & against 0b10000000000 and a float the result is 0
       auto &dl = gutils->oldFunc->getParent()->getDataLayout();
-      auto size = dl.getTypeSizeInBits(BO.getType()) / 8;
       Type *diffTy = gutils->getShadowType(BO.getType());
 
-      auto FT = TR.query(&BO).IsAllFloat(size, dl);
+      auto FT = TR.query(&BO).allFloat(&BO, dl);
       auto eFT = FT;
       if (FT)
         for (int i = 0; i < 2; ++i) {
@@ -2684,9 +2742,8 @@ public:
     }
     case Instruction::Xor: {
       auto &dl = gutils->oldFunc->getParent()->getDataLayout();
-      auto size = dl.getTypeSizeInBits(BO.getType()) / 8;
 
-      auto FT = TR.query(&BO).IsAllFloat(size, dl);
+      auto FT = TR.query(&BO).allFloat(&BO, dl);
       auto eFT = FT;
 
       Value *dif[2] = {constantval0 ? nullptr : diffe(orig_op0, Builder2),
@@ -2722,12 +2779,11 @@ public:
     }
     case Instruction::Or: {
       auto &dl = gutils->oldFunc->getParent()->getDataLayout();
-      auto size = dl.getTypeSizeInBits(BO.getType()) / 8;
 
       Value *dif[2] = {constantval0 ? nullptr : diffe(orig_op0, Builder2),
                        constantval1 ? nullptr : diffe(orig_op1, Builder2)};
 
-      auto FT = TR.query(&BO).IsAllFloat(size, dl);
+      auto FT = TR.query(&BO).allFloat(&BO, dl);
       auto eFT = FT;
       // If & against 0b10000000000 and a float the result is a float
       if (FT)
@@ -2739,6 +2795,7 @@ public:
           }
           if (auto CV = dyn_cast<ConstantDataVector>(BO.getOperand(i))) {
             CI = dyn_cast_or_null<ConstantInt>(CV->getSplatValue());
+            FT = VectorType::get(FT, CV->getType()->getElementCount());
           }
           if (CI && dl.getTypeSizeInBits(eFT) ==
                         dl.getTypeSizeInBits(CI->getType())) {
@@ -2753,14 +2810,14 @@ public:
               validXor = true;
             } else if (
                 !AP.isNegative() &&
-                ((FT->isFloatTy()
+                ((eFT->isFloatTy()
 #if LLVM_VERSION_MAJOR > 16
                   && (AP & ~0b01111111100000000000000000000000ULL).isZero()
 #else
                   && (AP & ~0b01111111100000000000000000000000ULL).isNullValue()
 #endif
                       ) ||
-                 (FT->isDoubleTy()
+                 (eFT->isDoubleTy()
 #if LLVM_VERSION_MAJOR > 16
                   &&
                   (AP &
@@ -2782,10 +2839,10 @@ public:
                 prev = Builder2.CreateSub(prev, arg, "", /*NUW*/ true,
                                           /*NSW*/ false);
                 uint64_t num = 0;
-                if (FT->isFloatTy()) {
+                if (eFT->isFloatTy()) {
                   num = 127ULL << 23;
                 } else {
-                  assert(FT->isDoubleTy());
+                  assert(eFT->isDoubleTy());
                   num = 1023ULL << 52;
                 }
                 prev = Builder2.CreateAdd(
@@ -2816,6 +2873,48 @@ public:
       }
       goto def;
     }
+    case Instruction::LShr: {
+      if (!gutils->isConstantValue(orig_op0)) {
+        if (auto ci = dyn_cast<ConstantInt>(orig_op1)) {
+          size_t size = 1;
+          if (orig_op0->getType()->isSized())
+            size = (gutils->newFunc->getParent()
+                        ->getDataLayout()
+                        .getTypeSizeInBits(orig_op0->getType()) +
+                    7) /
+                   8;
+
+          if (Type *flt = TR.addingType(size, orig_op0)) {
+            auto bits = gutils->newFunc->getParent()
+                            ->getDataLayout()
+                            .getTypeAllocSizeInBits(flt);
+            if (ci->getSExtValue() >= (int64_t)bits &&
+                ci->getSExtValue() % bits == 0) {
+              auto rule = [&](Value *idiff) {
+                return Builder2.CreateLShr(idiff, ci);
+              };
+              auto dif = applyChainRule(orig_op0->getType(), Builder2, rule,
+                                        diffe(orig_op0, Builder2));
+              setDiffe(&BO, dif, Builder2);
+              return;
+            }
+          }
+        }
+      }
+      if (looseTypeAnalysis) {
+        forwardModeInvertedPointerFallback(BO);
+        llvm::errs() << "warning: binary operator is integer and constant: "
+                     << BO << "\n";
+        // if loose type analysis, assume this integer or is constant
+        return;
+      }
+      goto def;
+    }
+    case Instruction::AShr:
+    case Instruction::SDiv:
+    case Instruction::UDiv:
+    case Instruction::SRem:
+    case Instruction::URem:
     case Instruction::Shl:
     case Instruction::Mul:
     case Instruction::Sub:
@@ -2885,7 +2984,8 @@ public:
     bool forceErase = false;
     if (Mode == DerivativeMode::ReverseModeGradient) {
       for (const auto &pair : gutils->rematerializableAllocations) {
-        if (pair.second.stores.count(&MS) && pair.second.LI) {
+        if (gutils->allocationsToBeRematerialized.count(pair.first) &&
+            pair.second.stores.count(&MS) && pair.second.LI) {
           forceErase = true;
         }
       }
@@ -2985,6 +3085,15 @@ public:
           if (!forwardsShadow && pair.second.LI &&
               pair.second.LI->contains(inst->getParent()))
             backwardsShadow = false;
+      }
+    }
+
+    if (auto arg = dyn_cast<Argument>(getBaseObject(MS.getOperand(0)))) {
+      unsigned argNo = arg->getArgNo();
+      if (argNo < gutils->nowrite_shadows.size() &&
+          gutils->nowrite_shadows[argNo]) {
+        forwardsShadow = false;
+        backwardsShadow = false;
       }
     }
 
@@ -3602,6 +3711,15 @@ public:
       }
     }
 
+    if (auto arg = dyn_cast<Argument>(getBaseObject(orig_dst))) {
+      unsigned argNo = arg->getArgNo();
+      if (argNo < gutils->nowrite_shadows.size() &&
+          gutils->nowrite_shadows[argNo]) {
+        forwardsShadow = false;
+        backwardsShadow = false;
+      }
+    }
+
     for (auto &&[floatTy_ref, seg_start_ref, seg_size_ref] : toIterate) {
       auto floatTy = floatTy_ref;
       auto seg_start = seg_start_ref;
@@ -3645,7 +3763,9 @@ public:
         SubTransferHelper(
             gutils, Mode, floatTy, ID, subdstalign, subsrcalign,
             /*offset*/ seg_start, gutils->isConstantValue(orig_dst), shadow_dst,
+            gutils->getNewFromOriginal(orig_dst),
             gutils->isConstantValue(orig_src), shadow_src,
+            gutils->getNewFromOriginal(orig_src),
             /*length*/ length, /*volatile*/ isVolatile, &MTI,
             /*allowForward*/ forwardsShadow, /*shadowsLookedup*/ false,
             /*backwardsShadow*/ backwardsShadow);
@@ -4116,6 +4236,11 @@ public:
         return false;
       }
       default:
+        if (!gutils->isConstantValue(&I)) {
+          auto toset =
+              Constant::getNullValue(gutils->getShadowType(I.getType()));
+          setDiffe(&I, toset, Builder2);
+        }
         if (gutils->isConstantInstruction(&I))
           return false;
         if (ID == Intrinsic::umax || ID == Intrinsic::smax ||
@@ -4143,10 +4268,6 @@ public:
              << Intrinsic::getName(ID) << "\n"
              << I;
         EmitNoDerivativeError(ss.str(), I, gutils, Builder2);
-        if (!gutils->isConstantValue(&I))
-          setDiffe(&I,
-                   Constant::getNullValue(gutils->getShadowType(I.getType())),
-                   Builder2);
         return false;
       }
       return false;
@@ -4213,11 +4334,14 @@ public:
     SmallVector<Value *, 4> OutTypes;
     SmallVector<Type *, 4> OutFPTypes;
 
+    std::vector<bool> nowrite_shadows = {false, false};
+
     for (unsigned i = 3; i < call.arg_size(); ++i) {
 
       auto argi = gutils->getNewFromOriginal(call.getArgOperand(i));
 
       pre_args.push_back(argi);
+      nowrite_shadows.push_back(false);
 
       if (Mode != DerivativeMode::ReverseModePrimal) {
         IRBuilder<> Builder2(&call);
@@ -4242,6 +4366,33 @@ public:
               lookup(gutils->invertPointerM(call.getArgOperand(i), Builder2),
                      Builder2));
         }
+
+        auto baseOp = getBaseObject(call.getArgOperand(i));
+        if (auto arg = dyn_cast<Argument>(baseOp)) {
+          if (arg->getArgNo() < gutils->nowrite_shadows.size() &&
+              gutils->nowrite_shadows[arg->getArgNo()]) {
+            nowrite_shadows.back() = true;
+          }
+        }
+        if (isAllocationCall(baseOp, gutils->TLI)) {
+          assert(!gutils->isConstantValue(baseOp));
+          if (Mode == DerivativeMode::ReverseModeCombined ||
+              Mode == DerivativeMode::ReverseModeGradient ||
+              Mode == DerivativeMode::ReverseModePrimal ||
+              Mode == DerivativeMode::ForwardModeSplit) {
+            bool forwardsShadow = true;
+            {
+              auto found = gutils->backwardsOnlyShadows.find(baseOp);
+              if (found != gutils->backwardsOnlyShadows.end()) {
+                forwardsShadow = found->second.primalInitialize;
+              }
+            }
+            if (!forwardsShadow) {
+              nowrite_shadows.back() = true;
+            }
+          }
+        }
+
         pre_args.push_back(
             gutils->invertPointerM(call.getArgOperand(i), BuilderZ));
 
@@ -4320,9 +4471,9 @@ public:
             subretType, argsInverted, TR.analyzer->interprocedural,
             /*return is used*/ false,
             /*shadowReturnUsed*/ false, nextTypeInfo,
-            subsequent_calls_may_write, overwritten_args, false,
-            gutils->runtimeActivity, gutils->strongZero, gutils->getWidth(),
-            /*AtomicAdd*/ true,
+            subsequent_calls_may_write, overwritten_args, nowrite_shadows,
+            false, gutils->runtimeActivity, gutils->strongZero,
+            gutils->getWidth(), /*AtomicAdd*/ true,
             /*OpenMP*/ true);
         if (Mode == DerivativeMode::ReverseModePrimal) {
           assert(augmentedReturn);
@@ -4661,7 +4812,7 @@ public:
 
               ptr = B.CreateBitCast(
                   ptr,
-                  PointerType::get(
+                  getPointerType(
                       IntToFloatTy(dif->getType()),
                       cast<PointerType>(ptr->getType())->getAddressSpace()));
               dif = B.CreateBitCast(dif, IntToFloatTy(dif->getType()));
@@ -4808,7 +4959,7 @@ public:
               Builder2.CreateIntToPtr(dsto, getInt8PtrTy(dsto->getContext()));
         unsigned dstaddr =
             cast<PointerType>(dsto->getType())->getAddressSpace();
-        auto secretpt = PointerType::get(secretty, dstaddr);
+        auto secretpt = getPointerType(secretty, dstaddr);
         if (offset != 0) {
           dsto = Builder2.CreateConstInBoundsGEP1_64(
               Type::getInt8Ty(dsto->getContext()), dsto, offset);
@@ -4818,7 +4969,7 @@ public:
               Builder2.CreateIntToPtr(srco, getInt8PtrTy(dsto->getContext()));
         unsigned srcaddr =
             cast<PointerType>(srco->getType())->getAddressSpace();
-        secretpt = PointerType::get(secretty, srcaddr);
+        secretpt = getPointerType(secretty, srcaddr);
 
         if (offset != 0) {
           srco = Builder2.CreateConstInBoundsGEP1_64(
@@ -5186,6 +5337,7 @@ public:
 
     SmallVector<ValueType, 2> PreBundleTypes;
     SmallVector<ValueType, 2> BundleTypes;
+    std::vector<bool> nowrite_shadows;
 
     for (unsigned i = 0; i < call.arg_size(); ++i) {
 
@@ -5236,6 +5388,8 @@ public:
 
       ValueType preType = ValueType::Primal;
       ValueType revType = ValueType::Primal;
+
+      nowrite_shadows.push_back(false);
 
       // Keep the existing passed value if coming from outside.
       if (readNoneNoCapture ||
@@ -5345,7 +5499,35 @@ public:
           }
           args.push_back(lookup(darg, Builder2));
         }
+
+        auto baseOp = getBaseObject(call.getArgOperand(i));
+        if (auto arg = dyn_cast<Argument>(baseOp)) {
+          if (arg->getArgNo() < gutils->nowrite_shadows.size() &&
+              gutils->nowrite_shadows[arg->getArgNo()]) {
+            nowrite_shadows.back() = true;
+          }
+        }
+        if (isAllocationCall(baseOp, gutils->TLI)) {
+          assert(!gutils->isConstantValue(baseOp));
+          if (Mode == DerivativeMode::ReverseModeCombined ||
+              Mode == DerivativeMode::ReverseModeGradient ||
+              Mode == DerivativeMode::ReverseModePrimal ||
+              Mode == DerivativeMode::ForwardModeSplit) {
+            bool forwardsShadow = true;
+            {
+              auto found = gutils->backwardsOnlyShadows.find(baseOp);
+              if (found != gutils->backwardsOnlyShadows.end()) {
+                forwardsShadow = found->second.primalInitialize;
+              }
+            }
+            if (!forwardsShadow) {
+              nowrite_shadows.back() = true;
+            }
+          }
+        }
+
         if (Mode == DerivativeMode::ReverseModeGradient && !replaceFunction) {
+          nowrite_shadows.back() = true;
           pre_args.push_back(getUndefinedValueForType(M, argi->getType()));
         } else {
           pre_args.push_back(
@@ -5468,9 +5650,9 @@ public:
               RequestContext(&call, &BuilderZ), cast<Function>(called),
               subretType, argsInverted, TR.analyzer->interprocedural,
               /*return is used*/ subretused, shadowReturnUsed, nextTypeInfo,
-              subsequent_calls_may_write, overwritten_args, false,
-              gutils->runtimeActivity, gutils->strongZero, gutils->getWidth(),
-              gutils->AtomicAdd);
+              subsequent_calls_may_write, overwritten_args, nowrite_shadows,
+              false, gutils->runtimeActivity, gutils->strongZero,
+              gutils->getWidth(), gutils->AtomicAdd);
           if (Mode == DerivativeMode::ReverseModePrimal) {
             assert(augmentedReturn);
             auto subaugmentations =
@@ -5634,17 +5816,17 @@ public:
           if (Mode == DerivativeMode::ReverseModePrimal &&
               !gutils->unnecessaryIntermediates.count(&call)) {
 
-            std::map<UsageKey, bool> Seen;
+            std::map<UsageKey, bool> Seen =
+                gutils->populateSeenFromKnownRecompute();
             bool primalNeededInReverse = false;
-            for (auto pair : gutils->knownRecomputeHeuristic)
-              if (!pair.second) {
-                if (pair.first == &call) {
+            {
+              auto found = gutils->knownRecomputeHeuristic.find(&call);
+              if (found != gutils->knownRecomputeHeuristic.end()) {
+                if (!found->second) {
                   primalNeededInReverse = true;
-                  break;
-                } else {
-                  Seen[UsageKey(pair.first, QueryType::Primal)] = false;
                 }
               }
+            }
             if (!primalNeededInReverse) {
 
               auto minCutMode = (Mode == DerivativeMode::ReverseModePrimal)
@@ -5833,7 +6015,7 @@ public:
           shouldFree()) {
         assert(tape);
         auto tapep = BuilderZ.CreatePointerCast(
-            tape, PointerType::get(
+            tape, getPointerType(
                       fnandtapetype->tapeType,
                       cast<PointerType>(tape->getType())->getAddressSpace()));
         auto truetape =
@@ -6439,10 +6621,8 @@ public:
         if (gutils->knownRecomputeHeuristic.count(&call)) {
           primalNeededInReverse = !gutils->knownRecomputeHeuristic[&call];
         } else {
-          std::map<UsageKey, bool> Seen;
-          for (auto pair : gutils->knownRecomputeHeuristic)
-            if (!pair.second)
-              Seen[UsageKey(pair.first, QueryType::Primal)] = false;
+          std::map<UsageKey, bool> Seen =
+              gutils->populateSeenFromKnownRecompute();
           primalNeededInReverse =
               DifferentialUseAnalysis::is_value_needed_in_reverse<
                   QueryType::Primal>(gutils, &call, Mode, Seen, oldUnreachable);
@@ -6511,13 +6691,8 @@ public:
         noFree |= called->hasFnAttribute(Attribute::NoFree);
       }
 
-      std::map<UsageKey, bool> CacheResults;
-      for (auto pair : gutils->knownRecomputeHeuristic) {
-        if (!pair.second || gutils->unnecessaryIntermediates.count(
-                                cast<Instruction>(pair.first))) {
-          CacheResults[UsageKey(pair.first, QueryType::Primal)] = false;
-        }
-      }
+      std::map<UsageKey, bool> CacheResults =
+          gutils->populateSeenFromKnownRecompute();
 
       if (!noFree && !EnzymeGlobalActivity) {
         bool mayActiveFree = false;
@@ -6624,17 +6799,17 @@ public:
            !gutils->legalRecompute(&call, ValueToValueMapTy(), nullptr))) {
         if (!gutils->unnecessaryIntermediates.count(&call)) {
 
-          std::map<UsageKey, bool> Seen;
+          std::map<UsageKey, bool> Seen =
+              gutils->populateSeenFromKnownRecompute();
           bool primalNeededInReverse = false;
-          for (auto pair : gutils->knownRecomputeHeuristic)
-            if (!pair.second) {
-              if (pair.first == &call) {
+          {
+            auto found = gutils->knownRecomputeHeuristic.find(&call);
+            if (found != gutils->knownRecomputeHeuristic.end()) {
+              if (!found->second) {
                 primalNeededInReverse = true;
-                break;
-              } else {
-                Seen[UsageKey(pair.first, QueryType::Primal)] = false;
               }
             }
+          }
           if (!primalNeededInReverse) {
 
             auto minCutMode = (Mode == DerivativeMode::ReverseModePrimal)

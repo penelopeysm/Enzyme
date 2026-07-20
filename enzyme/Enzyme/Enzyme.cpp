@@ -77,6 +77,7 @@
 #include "DiffeGradientUtils.h"
 #include "EnzymeLogic.h"
 #include "GradientUtils.h"
+#include "PassUtils.h"
 #include "TraceInterface.h"
 #include "TraceUtils.h"
 #include "Utils.h"
@@ -1137,7 +1138,13 @@ public:
     FnTypeInfo type_args(fn);
     for (auto &a : type_args.Function->args()) {
       TypeTree dt;
-      if (a.getType()->isFPOrFPVectorTy()) {
+      bool parsed = false;
+      if (fn->getAttributes().hasParamAttr(a.getArgNo(), "enzyme_type")) {
+        auto attr =
+            fn->getAttributes().getParamAttr(a.getArgNo(), "enzyme_type");
+        dt = TypeTree::parse(attr.getValueAsString(), fn->getContext());
+        parsed = true;
+      } else if (a.getType()->isFPOrFPVectorTy()) {
         dt = ConcreteType(a.getType()->getScalarType());
       } else if (a.getType()->isPointerTy()) {
 #if LLVM_VERSION_MAJOR < 17
@@ -1154,18 +1161,24 @@ public:
       } else if (a.getType()->isIntOrIntVectorTy()) {
         dt = ConcreteType(BaseType::Integer);
       }
-      type_args.Arguments.insert(
-          std::pair<Argument *, TypeTree>(&a, dt.Only(-1, nullptr)));
+      type_args.Arguments.insert(std::pair<Argument *, TypeTree>(
+          &a, parsed ? dt : dt.Only(-1, nullptr)));
       // TODO note that here we do NOT propagate constants in type info (and
       // should consider whether we should)
       type_args.KnownValues.insert(
           std::pair<Argument *, std::set<int64_t>>(&a, {}));
     }
     TypeTree dt;
-    if (fn->getReturnType()->isFPOrFPVectorTy()) {
+    bool parsed = false;
+    if (fn->getAttributes().hasRetAttr("enzyme_type")) {
+      auto attr = fn->getAttributes().getAttribute(AttributeList::ReturnIndex,
+                                                   "enzyme_type");
+      dt = TypeTree::parse(attr.getValueAsString(), fn->getContext());
+      parsed = true;
+    } else if (fn->getReturnType()->isFPOrFPVectorTy()) {
       dt = ConcreteType(fn->getReturnType()->getScalarType());
     }
-    type_args.Return = dt.Only(-1, nullptr);
+    type_args.Return = parsed ? dt : dt.Only(-1, nullptr);
 
     type_args = TA.analyzeFunction(type_args).getAnalyzedTypeInfo();
     return type_args;
@@ -1446,10 +1459,12 @@ public:
 
     auto Arch = Triple(CI->getModule()->getTargetTriple()).getArch();
     bool AtomicAdd = Arch == Triple::nvptx || Arch == Triple::nvptx64 ||
-                     Arch == Triple::amdgcn;
+                     Arch == Triple::amd_target;
 
     TypeAnalysis TA(Logic);
     FnTypeInfo type_args = populate_type_args(TA, fn, mode);
+
+    std::vector<bool> nowrite_shadows(fn->arg_size(), false);
 
     IRBuilder Builder(CI);
     RequestContext context(CI, &Builder);
@@ -1480,9 +1495,9 @@ public:
       aug = &Logic.CreateAugmentedPrimal(
           context, fn, retType, constants, TA,
           /*returnUsed*/ false, /*shadowReturnUsed*/ false, type_args,
-          subsequent_calls_may_write, overwritten_args, forceAnonymousTape,
-          options.runtimeActivity, options.strongZero, width,
-          /*atomicAdd*/ AtomicAdd);
+          subsequent_calls_may_write, overwritten_args, nowrite_shadows,
+          forceAnonymousTape, options.runtimeActivity, options.strongZero,
+          width, /*atomicAdd*/ AtomicAdd);
       auto &DL = fn->getParent()->getDataLayout();
       if (!forceAnonymousTape) {
         assert(!aug->tapeType);
@@ -1559,9 +1574,8 @@ public:
       aug = &Logic.CreateAugmentedPrimal(
           context, fn, retType, constants, TA, returnUsed, shadowReturnUsed,
           type_args, subsequent_calls_may_write, overwritten_args,
-          forceAnonymousTape, options.runtimeActivity, options.strongZero,
-          width,
-          /*atomicAdd*/ AtomicAdd);
+          nowrite_shadows, forceAnonymousTape, options.runtimeActivity,
+          options.strongZero, width, /*atomicAdd*/ AtomicAdd);
       auto &DL = fn->getParent()->getDataLayout();
       if (!forceAnonymousTape) {
         assert(!aug->tapeType);
@@ -2595,7 +2609,7 @@ public:
               .getArch();
 
       bool AtomicAdd = Arch == Triple::nvptx || Arch == Triple::nvptx64 ||
-                       Arch == Triple::amdgcn;
+                       Arch == Triple::amd_target;
 
       IRBuilder<> Builder(CI);
       auto val = GradientUtils::GetOrCreateShadowConstant(
@@ -3056,9 +3070,8 @@ extern "C" void AddEnzymePass(LLVMPassManagerRef PM) {
 #include "llvm/Passes/PassPlugin.h"
 #endif
 
-class EnzymeNewPM final : public EnzymeBase,
-                          public AnalysisInfoMixin<EnzymeNewPM> {
-  friend struct llvm::AnalysisInfoMixin<EnzymeNewPM>;
+class EnzymeNewPM final : public EnzymeBase, public PassParent<EnzymeNewPM> {
+  friend PassParent<EnzymeNewPM>;
 
 private:
   static llvm::AnalysisKey Key;
@@ -3122,7 +3135,11 @@ AnalysisKey EnzymeNewPM::Key;
 #include "llvm/Transforms/Scalar/MergedLoadStoreMotion.h"
 
 static InlineParams getInlineParamsFromOptLevel(OptimizationLevel Level) {
+#if LLVM_VERSION_MAJOR >= 23
+  return getInlineParamsFromOptLevel(static_cast<unsigned>(Level));
+#else
   return getInlineParams(Level.getSpeedupLevel(), Level.getSizeLevel());
+#endif
 }
 
 #include "llvm/Transforms/Scalar/LowerConstantIntrinsics.h"
@@ -3157,7 +3174,12 @@ void augmentPassBuilder(llvm::PassBuilder &PB) {
     bool LTOPreLink = false;
     // First rotate loops that may have been un-rotated by prior passes.
     // Disable header duplication at -Oz.
+#if LLVM_VERSION_MAJOR >= 23
+    LPM.addPass(LoopRotatePass(/*EnableLoopHeaderDuplication=*/true, LTOPreLink,
+                               /*CheckExitCount=*/true));
+#else
     LPM.addPass(LoopRotatePass(Level != OptimizationLevel::Oz, LTOPreLink));
+#endif
     // Some loops may have become dead by now. Try to delete them.
     // FIXME: see discussion in https://reviews.llvm.org/D112851,
     //        this may need to be revisited once we run GVN before
@@ -3250,7 +3272,12 @@ void augmentPassBuilder(llvm::PassBuilder &PB) {
     // system libraries and other oracles.
     MPM.addPass(InferFunctionAttrsPass());
 
-    if (Level.getSpeedupLevel() > 1) {
+#if LLVM_VERSION_MAJOR >= 23
+    if (Level > OptimizationLevel::O1)
+#else
+    if (Level.getSpeedupLevel() > 1)
+#endif
+    {
       MPM.addPass(createModuleToFunctionPassAdaptor(CallSiteSplittingPass(),
                                                     EagerlyInvalidateAnalyses));
 
@@ -3267,7 +3294,9 @@ void augmentPassBuilder(llvm::PassBuilder &PB) {
       // This opens opportunities for globalopt (and inlining) by
       // substituting function pointers passed as arguments to direct uses
       // of functions.
-#if LLVM_VERSION_MAJOR >= 16
+#if LLVM_VERSION_MAJOR >= 23
+      MPM.addPass(IPSCCPPass(IPSCCPOptions(/*AllowFuncSpec=*/true)));
+#elif LLVM_VERSION_MAJOR >= 16
       MPM.addPass(IPSCCPPass(IPSCCPOptions(/*AllowFuncSpec=*/
                                            Level != OptimizationLevel::Os &&
                                            Level != OptimizationLevel::Oz)));
@@ -3322,7 +3351,11 @@ void augmentPassBuilder(llvm::PassBuilder &PB) {
     // have to resolve varargs calls, etc, so let instcombine do this.
     FunctionPassManager PeepholeFPM;
     PeepholeFPM.addPass(InstCombinePass());
+#if LLVM_VERSION_MAJOR >= 23
+    if (Level > OptimizationLevel::O1)
+#else
     if (Level.getSpeedupLevel() > 1)
+#endif
       PeepholeFPM.addPass(AggressiveInstCombinePass());
 
     MPM.addPass(createModuleToFunctionPassAdaptor(std::move(PeepholeFPM),
@@ -3460,7 +3493,11 @@ void augmentPassBuilder(llvm::PassBuilder &PB) {
     MainFPM.addPass(MergedLoadStoreMotionPass());
 
     LoopPassManager LPM;
+#if LLVM_VERSION_MAJOR >= 23
+    if (EnableLoopFlatten && Level > OptimizationLevel::O1)
+#else
     if (EnableLoopFlatten && Level.getSpeedupLevel() > 1)
+#endif
       LPM.addPass(LoopFlattenPass());
     LPM.addPass(IndVarSimplifyPass());
     LPM.addPass(LoopDeletionPass());
@@ -3475,6 +3512,8 @@ void augmentPassBuilder(llvm::PassBuilder &PB) {
   PB.registerFullLinkTimeOptimizationEarlyEPCallback(loadLTO);
 }
 
+bool registerFixupJuliaPass(llvm::StringRef Name, llvm::ModulePassManager &MPM);
+
 extern "C" void registerEnzymeAndPassPipeline(llvm::PassBuilder &PB,
                                               bool augment = false) {
   if (augment) {
@@ -3485,6 +3524,9 @@ extern "C" void registerEnzymeAndPassPipeline(llvm::PassBuilder &PB,
          llvm::ArrayRef<llvm::PassBuilder::PipelineElement>) {
         if (Name == "enzyme") {
           MPM.addPass(EnzymeNewPM());
+          return true;
+        }
+        if (registerFixupJuliaPass(Name, MPM)) {
           return true;
         }
         if (Name == "preserve-nvvm") {

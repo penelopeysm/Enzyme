@@ -62,6 +62,12 @@
 #include <optional>
 #endif
 
+#if LLVM_VERSION_MAJOR >= 23
+#define amd_target amdgpu
+#else
+#define amd_target amdgcn
+#endif
+
 #include "llvm/IR/DiagnosticInfo.h"
 
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
@@ -88,6 +94,8 @@ enum class ErrorType {
   NoTruncate = 10,
   GCRewrite = 11,
   NaNError = 12,
+  ShowInternalError = 12,
+  NoAccumulate = 13,
 };
 
 extern "C" {
@@ -400,13 +408,6 @@ enum class ProbProgMode {
   Likelihood = 0,
   Trace = 1,
   Condition = 2,
-};
-
-enum class MProbProgMode {
-  Call = 0,
-  Simulate = 1,
-  Generate = 2,
-  Regenerate = 3,
 };
 
 /// Classification of value as an original program
@@ -772,7 +773,8 @@ parseTrueType(const llvm::MDNode *, DerivativeMode, bool const_src);
 /// point memory
 llvm::Function *getOrInsertDifferentialFloatMemcpy(
     llvm::Module &M, llvm::Type *T, unsigned dstalign, unsigned srcalign,
-    unsigned dstaddr, unsigned srcaddr, unsigned bitwidth);
+    unsigned dstaddr, unsigned srcaddr, unsigned bitwidth,
+    bool runtimeActivity = false);
 
 /// Create function for type that performs memcpy with a stride using blas copy
 void callMemcpyStridedBlas(llvm::IRBuilder<> &B, llvm::Module &M, BlasInfo blas,
@@ -822,7 +824,8 @@ llvm::Function *getOrInsertDifferentialFloatMemcpyMat(
 /// point memory
 llvm::Function *getOrInsertDifferentialFloatMemmove(
     llvm::Module &M, llvm::Type *T, unsigned dstalign, unsigned srcalign,
-    unsigned dstaddr, unsigned srcaddr, unsigned bitwidth);
+    unsigned dstaddr, unsigned srcaddr, unsigned bitwidth,
+    bool runtimeActivity = false);
 
 llvm::Function *getOrInsertCheckedFree(llvm::Module &M, llvm::CallInst *call,
                                        llvm::Type *Type, unsigned width);
@@ -1169,21 +1172,22 @@ enum class MPI_Elem {
   Old = 7
 };
 
-static inline llvm::PointerType *getInt8PtrTy(llvm::LLVMContext &Context,
-                                              unsigned AddressSpace = 0) {
-#if LLVM_VERSION_MAJOR >= 21
-  return llvm::PointerType::get(Context, AddressSpace);
+static inline llvm::PointerType *getPointerType(llvm::Type *T,
+                                                unsigned AddressSpace = 0) {
+#if LLVM_VERSION_MAJOR >= 17
+  return llvm::PointerType::get(T->getContext(), AddressSpace);
 #else
-  return llvm::PointerType::get(llvm::Type::getInt8Ty(Context), AddressSpace);
+  return llvm::PointerType::get(T, AddressSpace);
 #endif
 }
 
+static inline llvm::PointerType *getInt8PtrTy(llvm::LLVMContext &Context,
+                                              unsigned AddressSpace = 0) {
+  return getPointerType(llvm::Type::getInt8Ty(Context), AddressSpace);
+}
+
 static inline llvm::PointerType *getUnqual(llvm::Type *T) {
-#if LLVM_VERSION_MAJOR >= 17
-  return llvm::PointerType::getUnqual(T->getContext());
-#else
-  return llvm::PointerType::getUnqual(T);
-#endif
+  return getPointerType(T);
 }
 
 static inline llvm::StructType *getMPIHelper(llvm::LLVMContext &Context) {
@@ -1878,6 +1882,8 @@ static inline bool isNoAlias(const llvm::Value *val) {
   if (auto arg = llvm::dyn_cast<llvm::Argument>(val)) {
     arg->hasNoAliasAttr();
   }
+  if (llvm::isa<llvm::AllocaInst>(val))
+    return true;
   return false;
 }
 
@@ -2389,7 +2395,8 @@ bool isNVLoad(const llvm::Value *V);
 //! If checkLoadCaptured != 0, also consider catpures of any loads of the value
 //! as a capture (for the number of loads set).
 bool notCapturedBefore(llvm::Value *V, llvm::Instruction *inst,
-                       size_t checkLoadCaptured);
+                       size_t checkLoadCaptured,
+                       llvm::Instruction *startinst = nullptr);
 
 //! Check if value if b captured
 bool notCaptured(llvm::Value *V);
@@ -2403,8 +2410,9 @@ std::optional<bool>
 llvm::Optional<bool>
 #endif
 arePointersGuaranteedNoAlias(llvm::TargetLibraryInfo &TLI, llvm::AAResults &AA,
-                             llvm::LoopInfo &LI, llvm::Value *op0,
-                             llvm::Value *op1, bool offsetAllowed = false);
+                             llvm::DominatorTree &DT, llvm::LoopInfo &LI,
+                             llvm::Value *op0, llvm::Value *op1,
+                             bool offsetAllowed = false);
 
 static inline std::tuple<llvm::StringRef, llvm::StringRef, llvm::StringRef>
 tripleSplitDollar(llvm::StringRef caller) {
@@ -2435,7 +2443,48 @@ static inline std::string convertSRetTypeToString(llvm::Type *T) {
   return std::to_string((size_t)T);
 }
 
-static inline llvm::Type *convertSRetTypeFromString(llvm::StringRef str) {
+static inline llvm::Type *
+convertSRetTypeFromString(llvm::StringRef str, llvm::LLVMContext *C = nullptr) {
+  if (str == "test_type") {
+    assert(C);
+    llvm::SmallVector<llvm::Type *, 1> elts;
+#if LLVM_VERSION_MAJOR >= 17
+    elts.push_back(llvm::PointerType::get(*C, AddressSpace::Tracked));
+#else
+    elts.push_back(llvm::PointerType::get(llvm::StructType::get(*C, {}),
+                                          AddressSpace::Tracked));
+#endif
+    llvm::Type *inner = llvm::StructType::get(*C, elts);
+    llvm::SmallVector<llvm::Type *, 1> innerElts;
+    innerElts.push_back(inner);
+    return llvm::StructType::get(*C, innerElts);
+  }
+  if (str == "test_type2") {
+    assert(C);
+    return llvm::ArrayType::get(llvm::Type::getInt64Ty(*C), 6);
+  }
+  if (str == "test_type3") {
+    assert(C);
+    llvm::SmallVector<llvm::Type *, 1> elts;
+    elts.push_back(llvm::Type::getDoubleTy(*C));
+    return llvm::StructType::get(*C, elts);
+  }
+  if (str == "test_type4") {
+    assert(C);
+    llvm::SmallVector<llvm::Type *, 3> elts;
+    elts.push_back(llvm::ArrayType::get(llvm::Type::getDoubleTy(*C), 2));
+    elts.push_back(llvm::Type::getDoubleTy(*C));
+    elts.push_back(llvm::Type::getInt64Ty(*C));
+    return llvm::StructType::get(*C, elts);
+  }
+  if (str == "test_type5") {
+    assert(C);
+    llvm::SmallVector<llvm::Type *, 3> elts;
+    elts.push_back(llvm::ArrayType::get(llvm::Type::getDoubleTy(*C), 1));
+    elts.push_back(llvm::Type::getDoubleTy(*C));
+    elts.push_back(llvm::Type::getInt64Ty(*C));
+    return llvm::StructType::get(*C, elts);
+  }
   size_t idx;
   bool failed = str.consumeInteger(10, idx);
   (void)failed;
@@ -2513,5 +2562,13 @@ llvm::SmallVector<llvm::Value *, 1> getJuliaObjects(llvm::Value *v,
 // constant gep offsets and casts
 llvm::SmallVector<std::tuple<llvm::Instruction *, llvm::Value *, size_t>, 1>
 findAllUsersOf(llvm::Value *AI);
+
+static bool hasTerminator(llvm::BasicBlock *BB) {
+#if LLVM_VERSION_MAJOR >= 23
+  return BB->hasTerminator();
+#else
+  return BB->getTerminator();
+#endif
+}
 
 #endif // ENZYME_UTILS_H
